@@ -1,0 +1,11 @@
+# fly.toml — деплой: fly launch && fly secrets set ... && fly deploy
+
+app = "beauty-bot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
