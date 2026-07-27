@@ -1,6 +1,6 @@
 # Beauty Bot — Telegram-витрина мастера по маникюру
 
-Лёгкий Telegram-бот: прайс, портфолио с фото, информация о мастере, контакты.  
+Лёгкий Telegram-бот: прайс, портфолио, информация о мастере, контакты.  
 Контакт для записи — **только после подписки на канал**.
 
 ## Стек
@@ -12,7 +12,7 @@
 ## Быстрый старт
 
 ```bash
-cd beauty_bot
+cd sssmlkyy
 python -m venv venv
 venv\Scripts\activate          # Windows
 pip install -r requirements.txt
@@ -49,29 +49,26 @@ images/portfolio/
 
 | Раздел | Описание |
 |--------|----------|
-| **Прайс** | Полный прайс-лист в боте |
-| **Портфолио** | Фото работ, листание страницами |
-| **О мастере** | Описание, опыт, преимущества |
+| **Запись** | Контакт мастера — только после подписки |
+| **Работы** | Фото, листание |
+| **Прайс** | Полный прайс-лист |
+| **О мастере** | Описание и подход |
 | **Контакты** | Адрес, режим работы |
-| **Записаться** | Контакт мастера — только после подписки |
 
 ## Структура
 
 ```
-beauty_bot/
-├── main.py
-├── config/
-├── handlers/
-├── keyboards/
-├── callbacks/
-├── services/
-├── middlewares/
-├── texts/
-├── app_logging/
-└── images/portfolio/
+main.py
+config/             # settings, constants
+domain/             # enums, exceptions, dates (готово к записи/оплате)
+infrastructure/     # bot factory, DI container, process lock
+services/           # subscription, portfolio, session, media cache
+presentation/       # texts, keyboards, UI helpers
+handlers/           # thin routers
+middlewares/        # logging, throttle, DI, errors
 ```
 
 ## Важно
 
 - Бота нужно добавить **администратором в канал**, иначе проверка подписки не работает.
-- Кнопка «Написать мастеру» ведёт в личку — это единственная внешняя ссылка (без неё запись невозможна).
+- Кнопка «Написать» ведёт в личку мастера — это единственная внешняя ссылка для записи.

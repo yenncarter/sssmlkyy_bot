@@ -15,9 +15,9 @@ async def main() -> None:
     from aiogram.utils.token import validate_token
 
     from config.settings import settings
-    from utils.bot_factory import create_bot
+    from infrastructure.bot_factory import create_bot
 
-    print("=== Проверка сети для beauty_bot ===\n")
+    print("=== Проверка сети для бота ===\n")
     print(f"Прокси: {settings.proxy_url or 'не задан'}")
     print(f"Таймаут: {settings.request_timeout} сек\n")
 

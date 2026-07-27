@@ -1,48 +1,118 @@
-"""Beauty Bot — Telegram vitrina for nail master."""
+"""Application lifespan: wire → poll (with reconnect) → shutdown."""
+
+from __future__ import annotations
 
 import asyncio
 import sys
 
-from aiogram import Bot, Dispatcher
+from aiogram import Dispatcher
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import ClientConnectorError
+from aiohttp.client_exceptions import ClientError
 
 from app_logging.setup import setup_logging
+from config.settings import get_settings
 from handlers import setup_routers
+from infrastructure.bot_factory import create_bot
+from infrastructure.bot_setup import setup_bot_commands
+from infrastructure.container import AppContainer
+from infrastructure.scheduler import setup_scheduler
+from infrastructure.single_instance import acquire, release
 from middlewares.context import BotContextMiddleware
 from middlewares.error import ErrorMiddleware
 from middlewares.logging_mw import LoggingMiddleware
 from middlewares.throttling import ThrottlingMiddleware
-from utils.bot_factory import create_bot
-from utils.single_instance import acquire, release
 
 logger = setup_logging()
 
+_NETWORK_ERRORS = (
+    TelegramNetworkError,
+    ClientConnectorError,
+    ClientError,
+    ConnectionError,
+    OSError,
+    TimeoutError,
+)
+
+
+async def _run_polling(dp: Dispatcher, bot) -> None:
+    """Poll with auto-reconnect on flaky proxy/network drops."""
+    backoff = 3
+    while True:
+        try:
+            await dp.start_polling(bot, close_bot_session=False)
+            return
+        except TelegramConflictError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except _NETWORK_ERRORS as exc:
+            logger.warning(
+                "Telegram connection lost (%s: %s). Reconnect in %ss",
+                type(exc).__name__,
+                exc,
+                backoff,
+            )
+            print(
+                f"\nСвязь с Telegram пропала ({type(exc).__name__}). "
+                f"Переподключение через {backoff} сек…",
+                flush=True,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
 
 async def main() -> None:
-    """Entry point."""
-    from config.settings import settings
-
+    settings = get_settings()
     bot = create_bot(settings)
-    dp = Dispatcher()
+    container = await AppContainer.create(settings, bot)
+    dp = Dispatcher(storage=MemoryStorage())
 
     dp.update.middleware(LoggingMiddleware())
     dp.update.middleware(ThrottlingMiddleware())
-    dp.update.middleware(BotContextMiddleware(bot))
+    dp.update.middleware(BotContextMiddleware(container))
     dp.update.middleware(ErrorMiddleware())
 
     dp.include_router(setup_routers())
 
-    from utils.bot_setup import setup_bot_commands
     await setup_bot_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
 
-    logger.info("Bot starting...")
+    if not settings.welcome_image.exists():
+        logger.warning("Welcome image missing: %s", settings.welcome_image)
+    else:
+        logger.info("Welcome image: %s", settings.welcome_image.name)
+
+    if not settings.has_admins:
+        logger.warning(
+            "ADMIN_TELEGRAM_ID(S) not set — укажи numeric ID админа в .env"
+        )
+    else:
+        logger.info(
+            "Admin access configured for %s id(s)",
+            len(settings.admin_telegram_ids),
+        )
+
+    scheduler = setup_scheduler(
+        container.schedule, container.notify, container.bookings
+    )
+    scheduler.start()
+    logger.info("Scheduler started")
+
+    logger.info(
+        "Bot starting… db=%s proxy=%s",
+        settings.database_url.split("://")[0],
+        "on" if settings.proxy_url else "off",
+    )
     print("Бот запущен. Открой Telegram и напиши боту /start")
+    print("Админ: /admin")
     print("Остановка: Ctrl+C\n")
     try:
-        await dp.start_polling(bot)
+        await _run_polling(dp, bot)
     finally:
+        scheduler.shutdown(wait=False)
+        await container.shutdown()
         await bot.session.close()
         logger.info("Bot stopped")
 
@@ -67,12 +137,12 @@ if __name__ == "__main__":
             file=sys.stderr,
         )
         raise SystemExit(1)
-    except (ClientConnectorError, TelegramNetworkError):
+    except _NETWORK_ERRORS:
         print(
             "\nНе удалось подключиться к api.telegram.org\n"
             "\nЭто проблема сети на этом ПК. Решения:"
             "\n  1. python scripts\\check_connection.py  — диагностика"
-            "\n  2. PROXY_URL=socks5://127.0.0.1:7891 в .env (порт из VPN)"
+            "\n  2. PROXY_URL=socks5://127.0.0.1:10808 в .env (Happ SOCKS)"
             "\n  3. Запуск в облаке — см. DEPLOY.md (рекомендуется)",
             file=sys.stderr,
         )
@@ -80,9 +150,9 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"\nОшибка запуска: {exc}", file=sys.stderr)
         print("\nПроверь:")
-        print("  1. Файл .env в папке beauty_bot")
+        print("  1. Файл .env (BOT_TOKEN, ADMIN_TELEGRAM_ID, PAYMENT_LINK, …)")
         print("  2. Запуск: venv\\Scripts\\python.exe main.py")
-        print("  3. BOT_TOKEN в .env (от @BotFather)")
+        print("  3. ADMIN_TELEGRAM_ID в .env")
         raise SystemExit(1) from exc
     finally:
         release()

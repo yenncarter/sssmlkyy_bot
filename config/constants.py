@@ -1,25 +1,21 @@
 """Application-wide constants."""
 
-from enum import StrEnum
+from domain.enums import BookingStatus, CallbackAction
 
+# Re-export for existing imports during transition
+__all__ = [
+    "BookingStatus",
+    "CallbackAction",
+    "THROTTLE_RATE",
+    "THROTTLE_TTL_SECONDS",
+    "PORTFOLIO_EXTENSIONS",
+]
 
-class CallbackAction(StrEnum):
-    """Callback action identifiers."""
+# Soft rate-limit between user actions (seconds)
+THROTTLE_RATE: float = 0.35
 
-    BOOK = "book"
-    MY_BOOKINGS = "my_bookings"
-    PRICE = "price"
-    PORTFOLIO = "portfolio"
-    ABOUT = "about"
-    CONTACTS = "contacts"
-    CHECK_SUB = "check_sub"
-    BACK = "back"
-    PORTFOLIO_NEXT = "portfolio_next"
-    PORTFOLIO_PREV = "portfolio_prev"
-
-
-# Throttling
-THROTTLE_RATE: float = 0.25
+# Drop idle throttle entries after this many seconds
+THROTTLE_TTL_SECONDS: float = 600.0
 
 # Portfolio
 PORTFOLIO_EXTENSIONS: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp")

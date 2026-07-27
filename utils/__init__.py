@@ -1,5 +1,5 @@
-"""Utility helpers."""
+"""Legacy utils package — prefer infrastructure / domain / presentation."""
 
-from utils.bot_factory import create_bot
+from infrastructure.bot_factory import create_bot
 
 __all__ = ["create_bot"]

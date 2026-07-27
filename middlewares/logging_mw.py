@@ -1,5 +1,7 @@
 """Logging middleware."""
 
+from __future__ import annotations
+
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -11,7 +13,7 @@ logger = logging.getLogger("beauty_bot.middleware")
 
 
 class LoggingMiddleware(BaseMiddleware):
-    """Log incoming updates."""
+    """Log incoming updates with duration."""
 
     async def __call__(
         self,
@@ -21,14 +23,27 @@ class LoggingMiddleware(BaseMiddleware):
     ) -> Any:
         start = time.monotonic()
         user_id = _user_id(event)
-        logger.info("Update: %s user=%s", type(event).__name__, user_id)
+        kind = type(event).__name__
+        detail = _detail(event)
+        logger.debug("← %s user=%s %s", kind, user_id, detail)
         try:
             return await handler(event, data)
         finally:
-            logger.debug("Handled in %.0fms", (time.monotonic() - start) * 1000)
+            elapsed_ms = (time.monotonic() - start) * 1000
+            logger.debug("→ %s user=%s in %.0fms", kind, user_id, elapsed_ms)
 
 
 def _user_id(event: TelegramObject) -> str:
     if isinstance(event, (Message, CallbackQuery)) and event.from_user:
         return str(event.from_user.id)
     return "?"
+
+
+def _detail(event: TelegramObject) -> str:
+    if isinstance(event, CallbackQuery):
+        return f"cb={event.data!r}"
+    if isinstance(event, Message):
+        if event.text:
+            return f"text={event.text[:40]!r}"
+        return f"content={event.content_type}"
+    return ""

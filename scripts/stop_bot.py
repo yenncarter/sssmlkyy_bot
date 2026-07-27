@@ -56,7 +56,7 @@ def _stop_locked_process() -> None:
 async def _clear_webhook() -> None:
     sys.path.insert(0, str(ROOT))
     from config.settings import settings
-    from utils.bot_factory import create_bot
+    from infrastructure.bot_factory import create_bot
 
     bot = create_bot(settings)
     try:

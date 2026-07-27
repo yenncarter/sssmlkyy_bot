@@ -6,13 +6,14 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InputMediaPhoto
 
 from callbacks.factories import MenuCallback, PortfolioCallback
-from config.constants import CallbackAction
-from handlers.ui import delete_message_safe as _delete_safe
-from keyboards.common import footer_keyboard
-from keyboards.portfolio import portfolio_keyboard
+from config.settings import Settings
+from domain.enums import CallbackAction
+from presentation.keyboards.menu import footer_keyboard
+from presentation.keyboards.portfolio import portfolio_keyboard
+from presentation.texts.context import format_message
+from presentation.texts.messages import PORTFOLIO_CAPTION, PORTFOLIO_EMPTY
+from presentation.ui.screens import delete_message_safe, show_text
 from services.portfolio_service import PortfolioService
-from texts.messages import PORTFOLIO_CAPTION, PORTFOLIO_EMPTY
-from utils.text_context import format_message
 
 router = Router(name="portfolio")
 
@@ -21,9 +22,10 @@ router = Router(name="portfolio")
 async def portfolio_from_menu(
     callback: CallbackQuery,
     portfolio: PortfolioService,
+    settings: Settings,
 ) -> None:
     await callback.answer()
-    await _show_portfolio(callback, 0, portfolio, from_menu=True)
+    await _show_portfolio(callback, 0, portfolio, settings, from_menu=True)
 
 
 @router.callback_query(PortfolioCallback.filter())
@@ -31,22 +33,34 @@ async def portfolio_navigate(
     callback: CallbackQuery,
     callback_data: PortfolioCallback,
     portfolio: PortfolioService,
+    settings: Settings,
 ) -> None:
+    # Counter button — no-op, avoid flicker
+    if callback_data.action == CallbackAction.PORTFOLIO:
+        await callback.answer()
+        return
     await callback.answer()
-    await _show_portfolio(callback, callback_data.page, portfolio, from_menu=False)
+    await _show_portfolio(
+        callback,
+        callback_data.page,
+        portfolio,
+        settings,
+        from_menu=False,
+    )
 
 
 async def _show_portfolio(
     callback: CallbackQuery,
     index: int,
     portfolio: PortfolioService,
+    settings: Settings,
     from_menu: bool,
 ) -> None:
     if not portfolio.has_images:
-        await _render_text(
+        await show_text(
             callback,
-            format_message(PORTFOLIO_EMPTY),
-            from_menu=from_menu,
+            format_message(PORTFOLIO_EMPTY, settings),
+            footer_keyboard(),
         )
         return
 
@@ -57,18 +71,26 @@ async def _show_portfolio(
 
     if callback.message.photo and not from_menu:
         try:
-            await callback.message.edit_media(
-                media=InputMediaPhoto(media=media, caption=caption, parse_mode=ParseMode.HTML),
+            edited = await callback.message.edit_media(
+                media=InputMediaPhoto(
+                    media=media,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                ),
                 reply_markup=keyboard,
             )
-            if callback.message.photo:
-                portfolio.remember_file_id(index, callback.message.photo[-1].file_id)
+            # Prefer file_id from the edited message when Telegram returns it
+            photo = getattr(edited, "photo", None) if edited is not None else None
+            if photo:
+                portfolio.remember_file_id(index, photo[-1].file_id)
+            elif isinstance(media, str):
+                portfolio.remember_file_id(index, media)
             return
         except TelegramBadRequest:
             pass
 
     if from_menu:
-        await _delete_safe(callback)
+        await delete_message_safe(callback)
 
     msg = await callback.message.answer_photo(
         photo=media,
@@ -78,32 +100,3 @@ async def _show_portfolio(
     )
     if msg.photo:
         portfolio.remember_file_id(index, msg.photo[-1].file_id)
-
-
-async def _render_text(
-    callback: CallbackQuery,
-    text: str,
-    from_menu: bool,
-) -> None:
-    markup = footer_keyboard()
-    if from_menu and not callback.message.photo:
-        try:
-            await callback.message.edit_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-            return
-        except TelegramBadRequest:
-            pass
-
-    if from_menu:
-        await _delete_safe(callback)
-
-    await callback.message.answer(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=markup,
-        disable_web_page_preview=True,
-    )
