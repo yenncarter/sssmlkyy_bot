@@ -8,3 +8,7 @@ logs/
 .bot.pid
 .idea/
 .vscode/
+
+# Source originals (bot uses compressed cover.jpg)
+images/welcome/SS.JPG
+images/welcome/SS.jpg

@@ -1,0 +1,21 @@
+# Keep secrets and local junk out of Docker/Fly images
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+data/
+logs/
+*.db
+*.sqlite3
+.bot.pid
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.git/
+agent-transcripts/
+.cursor/
+docs/
+*.md
+!DEPLOY.md
