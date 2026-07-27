@@ -9,15 +9,11 @@ from config.settings import Settings
 
 
 def create_bot(settings: Settings) -> Bot:
-    """Build Bot session with optional proxy and safe defaults."""
-    session_kwargs: dict = {
-        "timeout": settings.request_timeout,
-        "limit": 20,
-    }
-    if settings.proxy_url:
-        session_kwargs["proxy"] = settings.proxy_url
-
-    session = AiohttpSession(**session_kwargs)
+    """Build Bot session with timeout and safe defaults (no proxy)."""
+    session = AiohttpSession(
+        timeout=settings.request_timeout,
+        limit=20,
+    )
     return Bot(
         token=settings.bot_token,
         session=session,

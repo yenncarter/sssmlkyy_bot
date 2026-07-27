@@ -1,6 +1,5 @@
 aiogram==3.29.1
 python-dotenv==1.1.0
-aiohttp-socks==0.10.1
 certifi==2025.6.15
 sqlalchemy[asyncio]==2.0.41
 greenlet==3.2.3

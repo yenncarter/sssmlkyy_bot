@@ -18,7 +18,6 @@ async def main() -> None:
     from infrastructure.bot_factory import create_bot
 
     print("=== Проверка сети для бота ===\n")
-    print(f"Прокси: {settings.proxy_url or 'не задан'}")
     print(f"Таймаут: {settings.request_timeout} сек\n")
 
     validate_token(settings.bot_token)
@@ -32,11 +31,8 @@ async def main() -> None:
     except Exception as exc:
         print(f"[2/2] Связь с Telegram — ОШИБКА:\n      {exc}")
         print("\n--- Что делать ---")
-        print("1. Попробуй в .env SOCKS5 (порт из VPN-клиента):")
-        print("   PROXY_URL=socks5://127.0.0.1:7891")
-        print("2. Или HTTP-прокси:")
-        print("   PROXY_URL=http://127.0.0.1:7890")
-        print("3. Если не помогает — запуск в облаке (файл DEPLOY.md)")
+        print("1. Включи системный VPN (Happ и т.п.), если Telegram режется.")
+        print("2. Или запускай бота в облаке — см. DEPLOY.md")
         raise SystemExit(1) from exc
     finally:
         await bot.session.close()

@@ -1,7 +1,14 @@
 # Deploy — @vikalashmeBot (время бота = Europe/Moscow, как на телефоне)
 
 Если с ПК не открывается `api.telegram.org` — крути бота в облаке.  
-Локально нужен SOCKS (`PROXY_URL`). На сервере `PROXY_URL` **не ставь**.
+Бот **не использует** `PROXY_URL` (прокси только для системы/VPN на ПК).
+
+Если на Fly когда-то ставили прокси — сними секрет (иначе он бесполезен, но лучше убрать):
+
+```powershell
+fly secrets unset PROXY_URL
+fly deploy
+```
 
 ---
 
@@ -23,13 +30,12 @@ CHANNEL_LINK=https://t.me/vikalashme
 MASTER_USERNAME=vikalashmee
 MASTER_PHONE=+7 927 757-77-59
 MASTER_NAME=Вика
-ADMIN_TELEGRAM_IDS=683067083,588662872
+ADMIN_TELEGRAM_IDS=683067083,588662872,8467391228
 PAYMENT_LINK=...
 PREPAYMENT_AMOUNT=500 ₽
 SLOT_HOLD_MINUTES=15
 DATABASE_URL=postgresql://...   # прод
 LOG_LEVEL=INFO
-# PROXY_URL — НЕ задавать на Fly/VPS
 ```
 
 ---
@@ -41,7 +47,7 @@ cd c:\webprojects\sssmlkyy
 fly launch --no-deploy
 fly postgres create
 fly postgres attach <имя-postgres-app>
-fly secrets set BOT_TOKEN=... CHANNEL_ID=@vikalashme CHANNEL_LINK=https://t.me/vikalashme MASTER_USERNAME=vikalashmee MASTER_PHONE="+7 927 757-77-59" MASTER_NAME=Вика ADMIN_TELEGRAM_IDS=683067083,588662872 PAYMENT_LINK=... PREPAYMENT_AMOUNT="500 ₽" SLOT_HOLD_MINUTES=15 LOG_LEVEL=INFO
+fly secrets set BOT_TOKEN=... CHANNEL_ID=@vikalashme CHANNEL_LINK=https://t.me/vikalashme MASTER_USERNAME=vikalashmee MASTER_PHONE="+7 927 757-77-59" MASTER_NAME=Вика ADMIN_TELEGRAM_IDS=683067083,588662872,8467391228 PAYMENT_LINK=... PREPAYMENT_AMOUNT="500 ₽" SLOT_HOLD_MINUTES=15 LOG_LEVEL=INFO
 fly deploy
 fly scale count 1
 fly logs
@@ -59,7 +65,7 @@ cd /home/ubuntu/sssmlkyy
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # заполни; PROXY_URL пустой
+cp .env.example .env   # заполни BOT_TOKEN и остальное
 python scripts/check_connection.py
 python main.py
 ```
@@ -100,14 +106,11 @@ docker build -t vikalashme-bot .
 docker run -d --name vikalashme-bot --env-file .env --restart unless-stopped vikalashme-bot
 ```
 
-На Fly/VPS в `.env` / secrets не должно быть `PROXY_URL=socks5://127.0.0.1:...`.
-
 ---
 
-## Локально (Happ SOCKS)
+## Локально
 
 ```env
-PROXY_URL=socks5://127.0.0.1:10808
 DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 ```
 
@@ -115,6 +118,8 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 python scripts\check_connection.py
 python main.py
 ```
+
+Если Telegram с ПК не открывается — системный VPN (Happ), либо сразу облако.
 
 ---
 

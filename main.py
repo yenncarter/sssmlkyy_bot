@@ -37,7 +37,7 @@ _NETWORK_ERRORS = (
 
 
 async def _run_polling(dp: Dispatcher, bot) -> None:
-    """Poll with auto-reconnect on flaky proxy/network drops."""
+    """Poll with auto-reconnect on flaky network drops."""
     backoff = 3
     while True:
         try:
@@ -66,53 +66,53 @@ async def _run_polling(dp: Dispatcher, bot) -> None:
 async def main() -> None:
     settings = get_settings()
     bot = create_bot(settings)
-    container = await AppContainer.create(settings, bot)
-    dp = Dispatcher(storage=MemoryStorage())
-
-    dp.update.middleware(LoggingMiddleware())
-    dp.update.middleware(ThrottlingMiddleware())
-    dp.update.middleware(BotContextMiddleware(container))
-    dp.update.middleware(ErrorMiddleware())
-
-    dp.include_router(setup_routers())
-
-    await setup_bot_commands(bot)
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    if not settings.welcome_image.exists():
-        logger.warning("Welcome image missing: %s", settings.welcome_image)
-    else:
-        logger.info("Welcome image: %s", settings.welcome_image.name)
-
-    if not settings.has_admins:
-        logger.warning(
-            "ADMIN_TELEGRAM_ID(S) not set — укажи numeric ID админа в .env"
-        )
-    else:
-        logger.info(
-            "Admin access configured for %s id(s)",
-            len(settings.admin_telegram_ids),
-        )
-
-    scheduler = setup_scheduler(
-        container.schedule, container.notify, container.bookings
-    )
-    scheduler.start()
-    logger.info("Scheduler started")
-
-    logger.info(
-        "Bot starting… db=%s proxy=%s",
-        settings.database_url.split("://")[0],
-        "on" if settings.proxy_url else "off",
-    )
-    print("Бот запущен. Открой Telegram и напиши боту /start")
-    print("Админ: /admin")
-    print("Остановка: Ctrl+C\n")
+    container = None
+    scheduler = None
     try:
+        container = await AppContainer.create(settings, bot)
+        dp = Dispatcher(storage=MemoryStorage())
+
+        dp.update.middleware(LoggingMiddleware())
+        dp.update.middleware(ThrottlingMiddleware())
+        dp.update.middleware(BotContextMiddleware(container))
+        dp.update.middleware(ErrorMiddleware())
+
+        dp.include_router(setup_routers())
+
+        await setup_bot_commands(bot)
+        await bot.delete_webhook(drop_pending_updates=True)
+
+        if not settings.welcome_image.exists():
+            logger.warning("Welcome image missing: %s", settings.welcome_image)
+        else:
+            logger.info("Welcome image: %s", settings.welcome_image.name)
+
+        if not settings.has_admins:
+            logger.warning(
+                "ADMIN_TELEGRAM_ID(S) not set — укажи numeric ID админа в .env"
+            )
+        else:
+            logger.info(
+                "Admin access configured for %s id(s)",
+                len(settings.admin_telegram_ids),
+            )
+
+        scheduler = setup_scheduler(
+            container.schedule, container.notify, container.bookings
+        )
+        scheduler.start()
+        logger.info("Scheduler started")
+
+        logger.info("Bot starting… db=%s", settings.database_url.split("://")[0])
+        print("Бот запущен. Открой Telegram и напиши боту /start")
+        print("Админ: /admin")
+        print("Остановка: Ctrl+C\n")
         await _run_polling(dp, bot)
     finally:
-        scheduler.shutdown(wait=False)
-        await container.shutdown()
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+        if container is not None:
+            await container.shutdown()
         await bot.session.close()
         logger.info("Bot stopped")
 
@@ -140,10 +140,9 @@ if __name__ == "__main__":
     except _NETWORK_ERRORS:
         print(
             "\nНе удалось подключиться к api.telegram.org\n"
-            "\nЭто проблема сети на этом ПК. Решения:"
-            "\n  1. python scripts\\check_connection.py  — диагностика"
-            "\n  2. PROXY_URL=socks5://127.0.0.1:10808 в .env (Happ SOCKS)"
-            "\n  3. Запуск в облаке — см. DEPLOY.md (рекомендуется)",
+            "\nПроверь сеть / VPN на этом ПК, либо запускай бота в облаке "
+            "(см. DEPLOY.md).\n"
+            "Диагностика: python scripts\\check_connection.py",
             file=sys.stderr,
         )
         raise SystemExit(1)

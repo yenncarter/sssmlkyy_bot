@@ -58,7 +58,6 @@ class Settings:
     log_level: str
     portfolio_dir: Path
     welcome_image: Path
-    proxy_url: str | None
     request_timeout: int
     database_url: str
     # Ordered: first ID is the primary admin (master), rest are support.
@@ -181,7 +180,6 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             portfolio_dir=PORTFOLIO_DIR,
             welcome_image=WELCOME_IMAGE,
-            proxy_url=os.getenv("PROXY_URL") or None,
             request_timeout=request_timeout,
             database_url=database_url,
             admin_telegram_ids=admin_telegram_ids,

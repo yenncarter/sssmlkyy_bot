@@ -74,7 +74,6 @@ async def main() -> None:
     print(f"admins: {list(settings.admin_telegram_ids)} (primary={settings.primary_admin_id})")
     print(f"channel: {settings.channel_link}")
     print(f"master: @{settings.master_username} {settings.master_phone}")
-    print(f"proxy: {'on' if settings.proxy_url else 'off'}")
     print(f"welcome: {settings.welcome_image.exists()}")
     print(f"payment: {bool(settings.payment_link)}")
 
