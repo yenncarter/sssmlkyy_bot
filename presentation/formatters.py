@@ -62,111 +62,96 @@ def _relative_ru(moment: datetime, *, now: datetime | None = None) -> str:
     current = now or now_local()
     delta = current - moment
     if delta < timedelta(0):
-        return moment.strftime("%d.%m %H:%M")
+        return moment.strftime("%d.%m.%Y %H:%M")
     seconds = int(delta.total_seconds())
     if seconds < 60:
-        return "сейчас"
+        return "только что"
     if seconds < 3600:
-        return f"{seconds // 60}м"
+        return f"{seconds // 60} мин назад"
     if seconds < 86400:
-        return f"{seconds // 3600}ч"
+        return f"{seconds // 3600} ч назад"
     days = delta.days
     if days == 1:
-        return "1д"
+        return "вчера"
     if days < 14:
-        return f"{days}д"
-    return moment.strftime("%d.%m.%Y")
+        return f"{days} дн. назад"
+    return moment.strftime("%d.%m.%Y %H:%M")
 
 
-def _flag(ok: bool) -> str:
-    return "✅" if ok else "❌"
+def _pre_block(rows: list[tuple[str, str]], *, key_width: int = 14) -> str:
+    """Aligned monospace key/value table (HTML-escaped)."""
+    lines = [f"{key:<{key_width}}{value}" for key, value in rows]
+    return f"<pre>{escape('\n'.join(lines))}</pre>"
 
 
 def format_bot_status(status: BotStatus) -> str:
-    """Ops dashboard for /status — scan in 3 seconds, not a client card."""
+    """Ops /status card: bold section titles + monospace tables."""
     now = status.collected_at
     problems = status.problems
     n_err = len(problems)
 
     if not problems:
-        head = "🛠 <b>STATUS</b>  ✅"
+        head = "<b>Статус</b>  ✅  ок"
     elif status.integrity or (
         status.previous_bookings >= 3 and status.bookings_total == 0
     ):
-        head = f"🛠 <b>STATUS</b>  ⛔️  <b>{n_err}</b>"
+        head = f"<b>Статус</b>  ⛔️  проблем: <b>{n_err}</b>"
     else:
-        head = f"🛠 <b>STATUS</b>  ⚠️  <b>{n_err}</b>"
+        head = f"<b>Статус</b>  ⚠️  замечаний: <b>{n_err}</b>"
 
-    lines = [
+    parts = [
         head,
-        f"<code>{now.strftime('%d.%m.%Y %H:%M')}</code>",
+        f"<pre>{escape(now.strftime('%d.%m.%Y %H:%M'))}</pre>",
     ]
 
     if problems:
-        lines.append("")
-        for problem in problems:
-            lines.append(f"⚠️ {escape(problem)}")
+        parts.append("")
+        parts.append("<b>Проблемы</b>")
+        problem_text = "\n".join(f"{i}. {p}" for i, p in enumerate(problems, 1))
+        parts.append(f"<pre>{escape(problem_text)}</pre>")
 
     size = _file_size_label(status.db_path) or "—"
-    where = "🐳" if status.in_container else "💻"
-    path = status.db_path or "managed"
     mtime = (
         _relative_ru(status.db_mtime, now=now)
         if status.db_mtime is not None
         else "—"
     )
-    lines.extend(
-        [
-            "",
-            "💾 <b>DB</b>",
-            (
-                f"{escape(status.backend)} · {where} · <b>{size}</b>"
-                f" · ✏️ {mtime}"
-            ),
-            f"<code>{escape(path)}</code>",
-            (
-                f"🗄 {_flag(status.storage is None)}"
-                f"  🧩 {_flag(status.integrity is None)}"
-            ),
-        ]
-    )
-    if status.storage:
-        lines.append(f"🗄 {escape(status.storage)}")
-    if status.integrity:
-        lines.append(f"🧩 {escape(status.integrity)}")
+    db_rows = [
+        ("движок", status.backend),
+        ("где", "контейнер" if status.in_container else "локально"),
+        ("размер", size),
+        ("путь", status.db_path or "managed (не файл)"),
+        ("хранилище", "ok" if status.storage is None else status.storage),
+        ("целостность", "ok" if status.integrity is None else status.integrity),
+        ("файл изменён", mtime),
+    ]
+    parts.extend(["", "<b>База</b>", _pre_block(db_rows)])
 
     if status.last_backup is None:
-        backup = "❌ нет"
-        if status.bookings_total > 0:
-            backup += "  ⚠️"
+        backup_rows = [
+            ("последний", "нет"),
+            ("состояние", "нет бэкапа" if status.bookings_total > 0 else "пусто — ок"),
+        ]
     else:
         stale = (now - status.last_backup) >= BACKUP_STALE_AFTER
-        mark = "⚠️" if stale else "✅"
-        backup = (
-            f"{mark} <b>{status.last_backup.strftime('%d.%m %H:%M')}</b>"
-            f" · {_relative_ru(status.last_backup, now=now)}"
-        )
-    lines.extend(["", f"📦 <b>Backup</b>  {backup}"])
-
-    hist = (
-        f" · was <b>{status.previous_bookings}</b>"
-        if status.previous_bookings
-        else ""
-    )
-    lines.extend(
-        [
-            "",
-            "📋 <b>Bookings</b>",
-            (
-                f"🔥 <b>{status.live_bookings}</b>"
-                f"   ✅ {status.bookings_active}"
-                f"  ⏳ {status.bookings_pending}"
-                f"  ❌ {status.bookings_cancelled}"
-                f"  🏁 {status.bookings_completed}"
-            ),
-            f"Σ <b>{status.bookings_total}</b>{hist}",
+        backup_rows = [
+            ("последний", status.last_backup.strftime("%d.%m.%Y %H:%M")),
+            ("назад", _relative_ru(status.last_backup, now=now)),
+            ("состояние", "устарел" if stale else "ok"),
         ]
-    )
+    parts.extend(["", "<b>Бэкап</b>", _pre_block(backup_rows)])
+
+    book_rows = [
+        ("живых", str(status.live_bookings)),
+        ("активных", str(status.bookings_active)),
+        ("ждут оплату", str(status.bookings_pending)),
+        ("отменено", str(status.bookings_cancelled)),
+        ("завершено", str(status.bookings_completed)),
+        ("всего", str(status.bookings_total)),
+    ]
+    if status.previous_bookings:
+        book_rows.append(("раньше было", str(status.previous_bookings)))
+    parts.extend(["", "<b>Записи</b>", _pre_block(book_rows)])
 
     slots_total = status.slots_total
     free_pct = (
@@ -174,44 +159,34 @@ def format_bot_status(status: BotStatus) -> str:
         if slots_total
         else "—"
     )
-    lines.extend(
-        [
-            "",
-            "🗓 <b>Slots</b>",
-            (
-                f"🟢 <b>{status.slots_free}</b>/{slots_total} ({free_pct})"
-                f"  ⏳ {status.slots_held}"
-                f"  🔒 {status.slots_booked}"
-                f"  🚫 {status.slots_blocked}"
-            ),
-            f"📅 <b>{status.days_upcoming}</b> ahead / {status.days_total} total",
-        ]
-    )
+    slot_rows = [
+        ("свободно", f"{status.slots_free} / {slots_total}  ({free_pct})"),
+        ("hold", str(status.slots_held)),
+        ("занято", str(status.slots_booked)),
+        ("закрыто", str(status.slots_blocked)),
+        ("дней вперёд", f"{status.days_upcoming} / {status.days_total} всего"),
+    ]
+    parts.extend(["", "<b>Слоты</b>", _pre_block(slot_rows)])
 
-    lines.extend(["", "📌 <b>Next</b>"])
+    parts.append("")
+    parts.append("<b>Ближайшие</b>")
     if status.next_visits:
-        for visit in status.next_visits:
-            mark = "⏳" if visit.status == "ждёт оплату" else "✅"
-            lines.append(
-                f"{mark} <b>{escape(visit.when)}</b> · {escape(visit.name)}"
-            )
-    else:
-        lines.append("—")
-
-    lines.extend(
-        [
-            "",
-            "⚙️ <b>Runtime</b>",
-            (
-                f"⏱ <b>{status.open_time}–{status.close_time}</b>"
-                f" · {status.slot_minutes}м · hold {status.hold_minutes}м"
-            ),
-            (
-                f"💳 {escape(status.prepayment)}"
-                f" · 👤 {status.admins}"
-                f" · 🖼 {status.media_cached}"
-                f" · 📢 {escape(status.channel)}"
-            ),
+        visit_rows = [
+            (visit.when, f"{visit.name}  [{visit.status}]")
+            for visit in status.next_visits
         ]
-    )
-    return "\n".join(lines)
+        parts.append(_pre_block(visit_rows, key_width=18))
+    else:
+        parts.append("<pre>—</pre>")
+
+    cfg_rows = [
+        ("часы", f"{status.open_time}–{status.close_time}"),
+        ("шаг слота", f"{status.slot_minutes} мин"),
+        ("hold", f"{status.hold_minutes} мин"),
+        ("предоплата", status.prepayment),
+        ("админов", str(status.admins)),
+        ("канал", status.channel),
+        ("кэш фото", str(status.media_cached)),
+    ]
+    parts.extend(["", "<b>Конфиг</b>", _pre_block(cfg_rows)])
+    return "\n".join(parts)
