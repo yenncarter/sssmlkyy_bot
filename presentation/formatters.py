@@ -80,8 +80,8 @@ def _relative_ru(moment: datetime, *, now: datetime | None = None) -> str:
 
 def _pre_block(rows: list[tuple[str, str]], *, key_width: int = 14) -> str:
     """Aligned monospace key/value table (HTML-escaped)."""
-    lines = [f"{key:<{key_width}}{value}" for key, value in rows]
-    return f"<pre>{escape('\n'.join(lines))}</pre>"
+    body = "\n".join(f"{key:<{key_width}}{value}" for key, value in rows)
+    return f"<pre>{escape(body)}</pre>"
 
 
 def format_bot_status(status: BotStatus) -> str:
