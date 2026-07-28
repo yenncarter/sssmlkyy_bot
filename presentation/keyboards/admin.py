@@ -37,6 +37,17 @@ def _back(action: str, item_id: int = 0) -> InlineKeyboardButton:
     )
 
 
+def admin_status_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="← Админ-меню",
+            callback_data=AdminCallback(action="home").pack(),
+        )
+    )
+    return builder.as_markup()
+
+
 def admin_home_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(

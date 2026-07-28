@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import datetime, time, timedelta
 from html import escape
 from pathlib import Path
 
 from db.models import Booking
-from domain.dates import format_date_short, format_time
+from domain.dates import format_date_short, format_time, now_local
 from domain.enums import BookingStatus
-from services.db_health import BotStatus
+from services.db_health import BACKUP_STALE_AFTER, BotStatus
 
 
 def format_hours(open_t: time, close_t: time) -> str:
@@ -57,96 +57,161 @@ def _file_size_label(path: str | None) -> str | None:
     return f"{size / (1024 * 1024):.1f} МБ"
 
 
+def _relative_ru(moment: datetime, *, now: datetime | None = None) -> str:
+    """Short human delta for status cards."""
+    current = now or now_local()
+    delta = current - moment
+    if delta < timedelta(0):
+        return moment.strftime("%d.%m %H:%M")
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "сейчас"
+    if seconds < 3600:
+        return f"{seconds // 60}м"
+    if seconds < 86400:
+        return f"{seconds // 3600}ч"
+    days = delta.days
+    if days == 1:
+        return "1д"
+    if days < 14:
+        return f"{days}д"
+    return moment.strftime("%d.%m.%Y")
+
+
+def _flag(ok: bool) -> str:
+    return "✅" if ok else "❌"
+
+
 def format_bot_status(status: BotStatus) -> str:
-    """Phone-friendly diagnostic card for /status."""
-    stamp = status.collected_at.strftime("%d.%m.%Y %H:%M")
+    """Ops dashboard for /status — scan in 3 seconds, not a client card."""
+    now = status.collected_at
     problems = status.problems
+    n_err = len(problems)
+
     if not problems:
-        verdict = "✅ <b>Всё в порядке</b>"
+        head = "🛠 <b>STATUS</b>  ✅"
     elif status.integrity or (
         status.previous_bookings >= 3 and status.bookings_total == 0
     ):
-        verdict = "⛔️ <b>Нужно внимание</b>"
+        head = f"🛠 <b>STATUS</b>  ⛔️  <b>{n_err}</b>"
     else:
-        verdict = "⚠️ <b>Есть замечания</b>"
+        head = f"🛠 <b>STATUS</b>  ⚠️  <b>{n_err}</b>"
 
     lines = [
-        "🛠 <b>Состояние бота</b>",
-        f"<code>{stamp}</code>",
-        "",
-        verdict,
+        head,
+        f"<code>{now.strftime('%d.%m.%Y %H:%M')}</code>",
     ]
-    for problem in problems:
-        lines.append(f"· {escape(problem)}")
 
-    path = status.db_path or "managed (не файл)"
-    size = _file_size_label(status.db_path)
-    path_line = escape(path) + (f" · {size}" if size else "")
-    lines.extend(
-        [
-            "",
-            "<b>База</b>",
-            f"· {escape(status.backend)}",
-            f"· {path_line}",
-            f"· хранилище: {'ок' if status.storage is None else escape(status.storage)}",
-            f"· целостность: {'ок' if status.integrity is None else escape(status.integrity)}",
-            f"· контейнер: {'да' if status.in_container else 'нет (локально)'}",
-        ]
+    if problems:
+        lines.append("")
+        for problem in problems:
+            lines.append(f"⚠️ {escape(problem)}")
+
+    size = _file_size_label(status.db_path) or "—"
+    where = "🐳" if status.in_container else "💻"
+    path = status.db_path or "managed"
+    mtime = (
+        _relative_ru(status.db_mtime, now=now)
+        if status.db_mtime is not None
+        else "—"
     )
-
     lines.extend(
         [
             "",
-            "<b>Записи</b>",
-            f"· активных: {status.bookings_active}",
-            f"· ждут оплату: {status.bookings_pending}",
-            f"· отменено: {status.bookings_cancelled}",
-            f"· завершено: {status.bookings_completed}",
-            f"· всего: {status.bookings_total}"
-            + (
-                f" (раньше: {status.previous_bookings})"
-                if status.previous_bookings
-                else ""
-            ),
-        ]
-    )
-
-    lines.extend(
-        [
-            "",
-            "<b>График</b>",
-            f"· дней вперёд: {status.days_upcoming} (всего {status.days_total})",
+            "💾 <b>DB</b>",
             (
-                f"· слоты: свободно {status.slots_free} · бронь {status.slots_held} · "
-                f"занято {status.slots_booked} · закрыто {status.slots_blocked}"
+                f"{escape(status.backend)} · {where} · <b>{size}</b>"
+                f" · ✏️ {mtime}"
+            ),
+            f"<code>{escape(path)}</code>",
+            (
+                f"🗄 {_flag(status.storage is None)}"
+                f"  🧩 {_flag(status.integrity is None)}"
             ),
         ]
     )
-
-    if status.next_visits:
-        lines.extend(["", "<b>Ближайшие</b>"])
-        for visit in status.next_visits:
-            lines.append(
-                f"· {escape(visit.when)} — {escape(visit.name)} "
-                f"<i>({escape(visit.status)})</i>"
-            )
-    else:
-        lines.extend(["", "<b>Ближайшие</b>", "· нет живых записей"])
+    if status.storage:
+        lines.append(f"🗄 {escape(status.storage)}")
+    if status.integrity:
+        lines.append(f"🧩 {escape(status.integrity)}")
 
     if status.last_backup is None:
-        backup_line = "ещё не было"
+        backup = "❌ нет"
+        if status.bookings_total > 0:
+            backup += "  ⚠️"
     else:
-        backup_line = status.last_backup.strftime("%d.%m.%Y %H:%M")
-    lines.extend(["", "<b>Бэкап</b>", f"· {backup_line}"])
+        stale = (now - status.last_backup) >= BACKUP_STALE_AFTER
+        mark = "⚠️" if stale else "✅"
+        backup = (
+            f"{mark} <b>{status.last_backup.strftime('%d.%m %H:%M')}</b>"
+            f" · {_relative_ru(status.last_backup, now=now)}"
+        )
+    lines.extend(["", f"📦 <b>Backup</b>  {backup}"])
+
+    hist = (
+        f" · was <b>{status.previous_bookings}</b>"
+        if status.previous_bookings
+        else ""
+    )
+    lines.extend(
+        [
+            "",
+            "📋 <b>Bookings</b>",
+            (
+                f"🔥 <b>{status.live_bookings}</b>"
+                f"   ✅ {status.bookings_active}"
+                f"  ⏳ {status.bookings_pending}"
+                f"  ❌ {status.bookings_cancelled}"
+                f"  🏁 {status.bookings_completed}"
+            ),
+            f"Σ <b>{status.bookings_total}</b>{hist}",
+        ]
+    )
+
+    slots_total = status.slots_total
+    free_pct = (
+        f"{round(100 * status.slots_free / slots_total)}%"
+        if slots_total
+        else "—"
+    )
+    lines.extend(
+        [
+            "",
+            "🗓 <b>Slots</b>",
+            (
+                f"🟢 <b>{status.slots_free}</b>/{slots_total} ({free_pct})"
+                f"  ⏳ {status.slots_held}"
+                f"  🔒 {status.slots_booked}"
+                f"  🚫 {status.slots_blocked}"
+            ),
+            f"📅 <b>{status.days_upcoming}</b> ahead / {status.days_total} total",
+        ]
+    )
+
+    lines.extend(["", "📌 <b>Next</b>"])
+    if status.next_visits:
+        for visit in status.next_visits:
+            mark = "⏳" if visit.status == "ждёт оплату" else "✅"
+            lines.append(
+                f"{mark} <b>{escape(visit.when)}</b> · {escape(visit.name)}"
+            )
+    else:
+        lines.append("—")
 
     lines.extend(
         [
             "",
-            "<b>Настройки</b>",
-            f"· часы {status.open_time}–{status.close_time} · шаг {status.slot_minutes} мин",
-            f"· предоплата {escape(status.prepayment)} · hold {status.hold_minutes} мин",
-            f"· админов: {status.admins}",
-            f"· кэш фото: {status.media_cached}",
+            "⚙️ <b>Runtime</b>",
+            (
+                f"⏱ <b>{status.open_time}–{status.close_time}</b>"
+                f" · {status.slot_minutes}м · hold {status.hold_minutes}м"
+            ),
+            (
+                f"💳 {escape(status.prepayment)}"
+                f" · 👤 {status.admins}"
+                f" · 🖼 {status.media_cached}"
+                f" · 📢 {escape(status.channel)}"
+            ),
         ]
     )
     return "\n".join(lines)

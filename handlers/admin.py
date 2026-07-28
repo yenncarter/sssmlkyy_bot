@@ -41,6 +41,7 @@ from presentation.keyboards.admin import (
     admin_home_keyboard,
     admin_hours_keyboard,
     admin_schedule_hub_keyboard,
+    admin_status_keyboard,
 )
 from presentation.keyboards.booking import days_keyboard, slots_keyboard
 from presentation.texts.messages import (
@@ -153,7 +154,10 @@ async def cmd_status(
     media_cache: MediaCache,
 ) -> None:
     status = await db_health.diagnose(media_cached=media_cache.size)
-    await message.answer(format_bot_status(status))
+    await message.answer(
+        format_bot_status(status),
+        reply_markup=admin_status_keyboard(),
+    )
 
 
 @router.callback_query(AdminCallback.filter(F.action == "home"))

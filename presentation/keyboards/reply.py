@@ -1,6 +1,11 @@
-"""Reply keyboard — Start at the bottom."""
+"""Reply keyboard helpers — strip legacy Start bar from existing chats."""
 
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from __future__ import annotations
+
+from contextlib import suppress
+
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import Message, ReplyKeyboardRemove
 
 from presentation.texts.messages import BTN_START
 
@@ -10,15 +15,13 @@ LEGACY_START_BUTTON_TEXT = "✨  Старт"
 START_BUTTON_ALIASES = frozenset({START_BUTTON_TEXT, LEGACY_START_BUTTON_TEXT})
 
 
-def start_reply_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=START_BUTTON_TEXT)]],
-        resize_keyboard=True,
-        is_persistent=True,
-        one_time_keyboard=False,
-        input_field_placeholder="Нажми «Старт»",
-    )
-
-
 def remove_reply_keyboard() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()
+
+
+async def strip_reply_keyboard(message: Message) -> None:
+    """Hide a sticky reply keyboard (Telegram only drops it via an explicit remove)."""
+    with suppress(TelegramBadRequest):
+        remove_msg = await message.answer("·", reply_markup=remove_reply_keyboard())
+        with suppress(TelegramBadRequest):
+            await remove_msg.delete()

@@ -24,7 +24,7 @@ from aiogram.types import (
 
 from config.settings import Settings
 from presentation.keyboards.menu import main_menu_keyboard
-from presentation.keyboards.reply import remove_reply_keyboard
+from presentation.keyboards.reply import strip_reply_keyboard
 from presentation.texts.context import format_message
 from presentation.texts.messages import MAIN_MENU, WELCOME
 from services.media_cache import MediaCache
@@ -177,11 +177,8 @@ async def send_welcome(
     settings: Settings,
     media_cache: MediaCache,
 ) -> None:
-    """Hide the reply Start button, then show cover + inline menu."""
-    with suppress(TelegramBadRequest):
-        remove_msg = await message.answer("·", reply_markup=remove_reply_keyboard())
-        with suppress(TelegramBadRequest):
-            await remove_msg.delete()
+    """Hide any sticky reply Start bar, then show cover + inline menu."""
+    await strip_reply_keyboard(message)
 
     msg = await message.answer_photo(
         photo=_welcome_media(settings, media_cache),

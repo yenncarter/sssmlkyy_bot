@@ -20,7 +20,14 @@ from sqlalchemy.orm import selectinload
 
 from config.settings import BOTHOST_DATA_DIR, Settings, running_in_container
 from db.models import Booking, Slot, WorkingDay, WorkSettings
-from domain.dates import format_date_short, format_time, now_local, to_local, today
+from domain.dates import (
+    LOCAL_TZ,
+    format_date_short,
+    format_time,
+    now_local,
+    to_local,
+    today,
+)
 from domain.enums import BookingStatus, SlotStatus
 from domain.slots import DEFAULT_CLOSE, DEFAULT_OPEN, DEFAULT_SLOT_MINUTES
 from presentation.texts.alerts import (
@@ -45,7 +52,7 @@ EMPTY_ALERT_MIN_HISTORY = 3
 # Losing more than this share of bookings between boots is not normal usage.
 SHRINK_ALERT_RATIO = 0.5
 BACKUP_STALE_AFTER = timedelta(days=3)
-NEXT_VISITS_LIMIT = 5
+NEXT_VISITS_LIMIT = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +91,7 @@ class BotStatus:
     collected_at: datetime
     backend: str
     db_path: str | None
+    db_mtime: datetime | None
     in_container: bool
     storage: str | None
     integrity: str | None
@@ -107,11 +115,26 @@ class BotStatus:
     prepayment: str
     hold_minutes: int
     admins: int
+    master_name: str
+    channel: str
     next_visits: tuple[NextVisit, ...]
 
     @property
     def healthy(self) -> bool:
         return self.storage is None and self.integrity is None
+
+    @property
+    def live_bookings(self) -> int:
+        return self.bookings_active + self.bookings_pending
+
+    @property
+    def slots_total(self) -> int:
+        return (
+            self.slots_free
+            + self.slots_held
+            + self.slots_booked
+            + self.slots_blocked
+        )
 
     @property
     def problems(self) -> list[str]:
@@ -280,10 +303,20 @@ class DbHealthService:
             logger.exception("Не удалось собрать диагностику")
 
         db_path = settings.sqlite_path
+        db_mtime: datetime | None = None
+        if db_path is not None:
+            try:
+                db_mtime = datetime.fromtimestamp(
+                    db_path.stat().st_mtime, tz=LOCAL_TZ
+                )
+            except OSError:
+                db_mtime = None
+
         return BotStatus(
             collected_at=now_local(),
             backend=settings.database_url.split("://")[0],
             db_path=str(db_path) if db_path else None,
+            db_mtime=db_mtime,
             in_container=running_in_container(),
             storage=storage,
             integrity=integrity,
@@ -307,6 +340,8 @@ class DbHealthService:
             prepayment=prepayment,
             hold_minutes=settings.slot_hold_minutes,
             admins=len(settings.admin_telegram_ids),
+            master_name=settings.master_name,
+            channel=settings.channel_name,
             next_visits=tuple(next_visits),
         )
 

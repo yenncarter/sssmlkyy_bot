@@ -7,7 +7,7 @@ from aiogram.types import Message
 
 from config.settings import Settings
 from presentation.keyboards.admin import admin_home_keyboard
-from presentation.keyboards.reply import START_BUTTON_ALIASES
+from presentation.keyboards.reply import START_BUTTON_ALIASES, strip_reply_keyboard
 from presentation.texts.messages import ADMIN_HOME
 from presentation.ui.screens import send_welcome
 from services.media_cache import MediaCache
@@ -31,6 +31,7 @@ async def cmd_start(
         session.mark_started(user_id)
 
     if settings.is_admin(user_id):
+        await strip_reply_keyboard(message)
         await message.answer(
             ADMIN_HOME + f"\n\nID: <code>{user_id}</code>",
             reply_markup=admin_home_keyboard(),

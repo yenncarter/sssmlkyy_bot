@@ -7,7 +7,6 @@ from aiogram.types import Message
 
 from config.settings import Settings
 from presentation.keyboards.menu import main_menu_keyboard
-from presentation.keyboards.reply import start_reply_keyboard
 from presentation.texts.context import format_message
 from presentation.texts.messages import PRESS_START, UNKNOWN_MESSAGE
 from services.session import SessionService
@@ -21,13 +20,12 @@ async def unknown_message(
     session: SessionService,
     settings: Settings,
 ) -> None:
-    """Before start — only the Start button; after — inline menu."""
+    """Before /start — nudge to open the bot; after — inline menu."""
     user_id = message.from_user.id if message.from_user else 0
     if not session.has_started(user_id):
         await message.answer(
             format_message(PRESS_START, settings),
             parse_mode=ParseMode.HTML,
-            reply_markup=start_reply_keyboard(),
         )
         return
 
