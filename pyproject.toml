@@ -1,0 +1,39 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = ["venv", "data", "logs"]
+
+[tool.ruff.lint]
+select = [
+    "F",   # pyflakes: unused imports/variables, dead names
+    "E",
+    "W",
+    "I",   # import order
+    "UP",  # outdated syntax for the target version
+    "B",   # bugbear: mutable defaults, silent except, loop variable capture
+    "SIM", # obvious simplifications
+    "RUF",
+]
+ignore = [
+    "B008",   # aiogram/FastAPI-style defaults in signatures are intentional
+    "RUF001", # Cyrillic text is the product language, not a homoglyph attack
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Standalone scripts must extend sys.path (and smoke tests must set the
+# environment) before importing the application packages.
+"scripts/*" = ["E402"]
+# Product copy: reflowing these strings would change what the client reads.
+"presentation/texts/messages.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["main.py", "app_logging", "callbacks", "config", "db", "domain", "handlers", "infrastructure", "middlewares", "presentation", "services"]
+exclude = "(venv|data|logs)"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true

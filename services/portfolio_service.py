@@ -82,12 +82,12 @@ class PortfolioService:
             return cached
         return FSInputFile(path)
 
-    def remember_file_id(self, index: int, file_id: str) -> None:
-        """Store uploaded file_id for instant re-use."""
+    async def remember_file_id(self, index: int, file_id: str) -> None:
+        """Persist the uploaded file_id so restarts don't re-upload the photo."""
         path, _, _ = self.get_image_at(index)
         if path is None:
             return
-        self._cache.set(self._cache_key(path), file_id)
+        await self._cache.remember(self._cache_key(path), file_id)
 
     @property
     def has_images(self) -> bool:

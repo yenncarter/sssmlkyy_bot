@@ -12,7 +12,7 @@ from presentation.keyboards.menu import footer_keyboard
 from presentation.keyboards.portfolio import portfolio_keyboard
 from presentation.texts.context import format_message
 from presentation.texts.messages import PORTFOLIO_CAPTION, PORTFOLIO_EMPTY
-from presentation.ui.screens import delete_message_safe, show_text
+from presentation.ui.screens import delete_message_safe, screen_message, show_text
 from services.portfolio_service import PortfolioService
 
 router = Router(name="portfolio")
@@ -69,9 +69,10 @@ async def _show_portfolio(
     keyboard = portfolio_keyboard(index, total)
     media = portfolio.get_media(index)
 
-    if callback.message.photo and not from_menu:
+    message = screen_message(callback)
+    if message is not None and message.photo and not from_menu:
         try:
-            edited = await callback.message.edit_media(
+            edited = await message.edit_media(
                 media=InputMediaPhoto(
                     media=media,
                     caption=caption,
@@ -82,21 +83,25 @@ async def _show_portfolio(
             # Prefer file_id from the edited message when Telegram returns it
             photo = getattr(edited, "photo", None) if edited is not None else None
             if photo:
-                portfolio.remember_file_id(index, photo[-1].file_id)
+                await portfolio.remember_file_id(index, photo[-1].file_id)
             elif isinstance(media, str):
-                portfolio.remember_file_id(index, media)
+                await portfolio.remember_file_id(index, media)
             return
         except TelegramBadRequest:
             pass
 
-    if from_menu:
+    if from_menu or message is None:
         await delete_message_safe(callback)
 
-    msg = await callback.message.answer_photo(
+    chat_id = callback.message.chat.id if callback.message else None
+    if callback.bot is None or chat_id is None:
+        return
+    msg = await callback.bot.send_photo(
+        chat_id,
         photo=media,
         caption=caption,
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
     if msg.photo:
-        portfolio.remember_file_id(index, msg.photo[-1].file_id)
+        await portfolio.remember_file_id(index, msg.photo[-1].file_id)

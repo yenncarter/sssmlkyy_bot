@@ -12,19 +12,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import func, select, text
-from sqlalchemy.orm import selectinload
 
 from config.settings import reload_settings
-from db.models import Booking, Slot, WorkSettings, WorkingDay
+from db.models import Booking, Slot, WorkingDay, WorkSettings
 from db.session import create_engine, create_session_factory, init_db
-from domain.dates import SAMARA_TZ, format_date_short, today
-from services.schedule_service import ScheduleService, parse_day
+from domain.dates import LOCAL_TZ, format_date_short, now_local, today
+from domain.parsing import parse_day
+from services.schedule_service import ScheduleService
 
 
 async def main() -> None:
-    now = datetime.now(SAMARA_TZ)
+    now = now_local()
     print("=== BOT CLOCK ===")
-    print(f"timezone: {SAMARA_TZ}  (= phone / Moscow)")
+    print(f"timezone: {LOCAL_TZ}  (= phone / Moscow)")
     print(f"now:      {now.strftime('%d.%m.%Y %H:%M:%S')} (UTC{now.strftime('%z')})")
     print(f"today:    {format_date_short(today())}")
     print(f"utc:      {datetime.now(ZoneInfo('UTC')).strftime('%H:%M:%S')}")
@@ -62,12 +62,15 @@ async def main() -> None:
         print("\n=== DB ===")
         print(f"url: {settings.database_url}")
         print(f"foreign_keys={fk} journal={jm}")
-        print(f"settings: {ws.open_time}-{ws.close_time} / {ws.slot_minutes} / {ws.prepayment_amount}")
+        print(
+            f"settings: {ws.open_time}-{ws.close_time} / "
+            f"{ws.slot_minutes} / {ws.prepayment_amount}"
+        )
         print(f"days={days_n} slots={slots_n} bookings={books_n}")
         print(f"orphan_slots={orphan} past_days={past_n}")
 
-    purged = await schedule.purge_past_days(force=True)
-    print(f"purge_past_days(force)={purged}")
+    purged = await schedule.purge_past_days()
+    print(f"purge_past_days={purged} (дни с историей записей не удаляются)")
 
     print("\n=== CONFIG ===")
     print(f"bot_id: {settings.bot_token.split(':')[0]}")

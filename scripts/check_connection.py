@@ -14,9 +14,10 @@ async def main() -> None:
     """Run network diagnostics."""
     from aiogram.utils.token import validate_token
 
-    from config.settings import settings
+    from config.settings import get_settings
     from infrastructure.bot_factory import create_bot
 
+    settings = get_settings()
     print("=== Проверка сети для бота ===\n")
     print(f"Таймаут: {settings.request_timeout} сек\n")
 
@@ -31,8 +32,8 @@ async def main() -> None:
     except Exception as exc:
         print(f"[2/2] Связь с Telegram — ОШИБКА:\n      {exc}")
         print("\n--- Что делать ---")
-        print("1. Включи системный VPN (Happ и т.п.), если Telegram режется.")
-        print("2. Или запускай бота в облаке — см. DEPLOY.md")
+        print("1. Проверь, что Telegram доступен с этой машины.")
+        print("2. Прод крутится на Bothost — см. DEPLOY.md")
         raise SystemExit(1) from exc
     finally:
         await bot.session.close()

@@ -10,18 +10,15 @@ class CallbackAction(StrEnum):
     MY_BOOKINGS = "my_bookings"
     PRICE = "price"
     PORTFOLIO = "portfolio"
-    CHANNEL = "channel"
     ABOUT = "about"
     FAQ = "faq"
     FAQ_BOOKING = "faq_booking"
     FAQ_VISIT = "faq_visit"
     FAQ_RULES = "faq_rules"
     CONTACTS = "contacts"
-    CHECK_SUB = "check_sub"
     BACK = "back"
     PORTFOLIO_NEXT = "portfolio_next"
     PORTFOLIO_PREV = "portfolio_prev"
-    CANCEL_BOOKING_FLOW = "cancel_booking_flow"
 
 
 class SlotStatus(StrEnum):
@@ -36,11 +33,3 @@ class BookingStatus(StrEnum):
     ACTIVE = "active"
     CANCELLED = "cancelled"
     COMPLETED = "completed"
-    NO_SHOW = "no_show"
-
-
-class ServiceCode(StrEnum):
-    MANICURE = "manicure"
-    GEL = "gel"
-    REMOVAL = "removal"
-    DESIGN = "design"

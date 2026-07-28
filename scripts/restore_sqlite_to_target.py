@@ -19,9 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select
 
-from db.models import Booking, Slot, WorkSettings, WorkingDay
+from db.models import Booking, Slot, WorkingDay, WorkSettings
 from db.session import create_engine, create_session_factory, init_db
 
 
@@ -175,7 +175,8 @@ async def main() -> None:
     if not target:
         raise SystemExit(
             "Set RESTORE_DATABASE_URL (prod) or DATABASE_URL.\n"
-            "Example: RESTORE_DATABASE_URL=postgresql://... python scripts/restore_sqlite_to_target.py"
+            "Example: RESTORE_DATABASE_URL=postgresql://... "
+            "python scripts/restore_sqlite_to_target.py"
         )
     # Safety: refuse overwriting local live db unless forced
     if "bot.db" in target and os.getenv("ALLOW_LOCAL_OVERWRITE") != "1":

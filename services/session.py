@@ -17,6 +17,3 @@ class SessionService:
 
     def has_started(self, user_id: int) -> bool:
         return user_id in self._started
-
-    def clear(self) -> None:
-        self._started.clear()

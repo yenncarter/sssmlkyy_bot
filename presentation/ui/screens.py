@@ -1,7 +1,16 @@
-"""Screen helpers — one active message, no chat spam."""
+"""Screen helpers — one active message, no chat spam.
+
+Telegram replaces messages older than ~48 hours with an `InaccessibleMessage`
+stub that has only `chat` and `message_id`. Touching any other attribute raises
+AttributeError, so every callback screen goes through :func:`screen_message`
+and falls back to sending a fresh message into the known chat.
+"""
 
 from __future__ import annotations
 
+from contextlib import suppress
+
+from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -20,25 +29,56 @@ from presentation.texts.context import format_message
 from presentation.texts.messages import MAIN_MENU, WELCOME
 from services.media_cache import MediaCache
 
-
 WELCOME_CACHE_KEY = "welcome:cover"
 UI_MSG_KEY = "ui_msg_id"
+CAPTION_LIMIT = 1024
+
+
+def screen_message(callback: CallbackQuery) -> Message | None:
+    """The callback's message, but only if it is still fully readable."""
+    message = callback.message
+    return message if isinstance(message, Message) else None
+
+
+def _chat_id(callback: CallbackQuery) -> int | None:
+    """Available even for inaccessible messages — enough to send a new screen."""
+    message = callback.message
+    return message.chat.id if message is not None else None
 
 
 async def delete_message_safe(callback: CallbackQuery) -> None:
-    try:
-        await callback.message.delete()
-    except TelegramBadRequest:
-        pass
-
-
-async def _delete_chat_message(bot, chat_id: int, message_id: int | None) -> None:
-    if not message_id:
+    message = callback.message
+    if message is None:
         return
-    try:
+    await _delete_chat_message(callback.bot, message.chat.id, message.message_id)
+
+
+async def _delete_chat_message(
+    bot: Bot | None,
+    chat_id: int,
+    message_id: int | None,
+) -> None:
+    if bot is None or not message_id:
+        return
+    with suppress(TelegramBadRequest):
         await bot.delete_message(chat_id, message_id)
-    except TelegramBadRequest:
-        pass
+
+
+async def _send_screen(
+    bot: Bot | None,
+    chat_id: int | None,
+    text: str,
+    markup: InlineKeyboardMarkup | None,
+) -> Message | None:
+    if bot is None or chat_id is None:
+        return None
+    return await bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
 
 
 async def show_text(
@@ -46,50 +86,42 @@ async def show_text(
     text: str,
     markup: InlineKeyboardMarkup | None = None,
 ) -> Message | None:
-    """Replace current callback screen with a text message (edit or delete+send).
+    """Replace the current callback screen with a text message.
 
-    If the current screen is a photo and caption fits Telegram's limit,
-    edit caption in place — no photo→text jump.
+    If the current screen is a photo and the caption fits Telegram's limit,
+    edit the caption in place — no photo→text jump.
     """
-    if callback.message is None:
-        return None
+    message = screen_message(callback)
+    if message is None:
+        # Stale screen: nothing to edit, but the chat is still reachable.
+        await delete_message_safe(callback)
+        return await _send_screen(callback.bot, _chat_id(callback), text, markup)
 
-    if callback.message.photo:
-        # Caption limit is 1024; keep cover photo when content fits.
-        if len(text) <= 1024:
+    if message.photo:
+        if len(text) <= CAPTION_LIMIT:
             try:
-                edited = await callback.message.edit_caption(
+                edited = await message.edit_caption(
                     caption=text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup,
                 )
-                return edited if isinstance(edited, Message) else callback.message
+                return edited if isinstance(edited, Message) else message
             except TelegramBadRequest:
                 pass
         await delete_message_safe(callback)
-        return await callback.message.answer(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            disable_web_page_preview=True,
-        )
+        return await _send_screen(callback.bot, message.chat.id, text, markup)
 
     try:
-        edited = await callback.message.edit_text(
+        edited = await message.edit_text(
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
             disable_web_page_preview=True,
         )
-        return edited if isinstance(edited, Message) else callback.message
+        return edited if isinstance(edited, Message) else message
     except TelegramBadRequest:
         await delete_message_safe(callback)
-        return await callback.message.answer(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            disable_web_page_preview=True,
-        )
+        return await _send_screen(callback.bot, message.chat.id, text, markup)
 
 
 async def show_screen(
@@ -102,7 +134,7 @@ async def show_screen(
     """Admin/client callback navigation — keep a single screen."""
     msg = await show_text(callback, text, markup)
     if state is not None and msg is not None:
-        await state.update_data(**{UI_MSG_KEY: msg.message_id})
+        await state.update_data({UI_MSG_KEY: msg.message_id})
 
 
 async def prompt_screen(
@@ -113,46 +145,23 @@ async def prompt_screen(
     state: FSMContext | None = None,
     delete_user: bool = True,
 ) -> Message:
-    """
-    After a user text reply: remove previous UI (+ optional user message), send one new screen.
-    """
+    """After a user text reply: drop the previous UI, send one new screen."""
     bot = message.bot
     chat_id = message.chat.id
     if state is not None:
         data = await state.get_data()
         await _delete_chat_message(bot, chat_id, data.get(UI_MSG_KEY))
     if delete_user:
-        try:
+        with suppress(TelegramBadRequest):
             await message.delete()
-        except TelegramBadRequest:
-            pass
-    msg = await bot.send_message(
-        chat_id,
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=markup,
-        disable_web_page_preview=True,
-    )
-    if state is not None:
-        await state.update_data(**{UI_MSG_KEY: msg.message_id})
-    return msg
-
-
-async def track_prompt(
-    message: Message,
-    text: str,
-    markup: InlineKeyboardMarkup | None = None,
-    *,
-    state: FSMContext,
-) -> Message:
-    """Send a prompt and remember its message id (for later cleanup)."""
     msg = await message.answer(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=markup,
         disable_web_page_preview=True,
     )
-    await state.update_data(**{UI_MSG_KEY: msg.message_id})
+    if state is not None:
+        await state.update_data({UI_MSG_KEY: msg.message_id})
     return msg
 
 
@@ -168,15 +177,11 @@ async def send_welcome(
     settings: Settings,
     media_cache: MediaCache,
 ) -> None:
-    """Hide reply Start button, then show cover + inline menu."""
-    try:
+    """Hide the reply Start button, then show cover + inline menu."""
+    with suppress(TelegramBadRequest):
         remove_msg = await message.answer("·", reply_markup=remove_reply_keyboard())
-        try:
+        with suppress(TelegramBadRequest):
             await remove_msg.delete()
-        except TelegramBadRequest:
-            pass
-    except TelegramBadRequest:
-        pass
 
     msg = await message.answer_photo(
         photo=_welcome_media(settings, media_cache),
@@ -185,7 +190,7 @@ async def send_welcome(
         reply_markup=main_menu_keyboard(settings),
     )
     if msg.photo:
-        media_cache.set(WELCOME_CACHE_KEY, msg.photo[-1].file_id)
+        await media_cache.remember(WELCOME_CACHE_KEY, msg.photo[-1].file_id)
 
 
 async def show_main_menu(
@@ -196,10 +201,11 @@ async def show_main_menu(
     caption = format_message(MAIN_MENU, settings)
     markup = main_menu_keyboard(settings)
     media = _welcome_media(settings, media_cache)
+    message = screen_message(callback)
 
-    if callback.message and callback.message.photo:
+    if message is not None and message.photo:
         try:
-            edited = await callback.message.edit_media(
+            edited = await message.edit_media(
                 media=InputMediaPhoto(
                     media=media,
                     caption=caption,
@@ -209,22 +215,25 @@ async def show_main_menu(
             )
             photo = getattr(edited, "photo", None) if edited is not None else None
             if photo:
-                media_cache.set(WELCOME_CACHE_KEY, photo[-1].file_id)
+                await media_cache.remember(WELCOME_CACHE_KEY, photo[-1].file_id)
             elif isinstance(media, str):
-                media_cache.set(WELCOME_CACHE_KEY, media)
+                await media_cache.remember(WELCOME_CACHE_KEY, media)
             return
         except TelegramBadRequest:
             pass
 
-    # Text screen or failed photo edit → restore cover + menu.
+    # Text screen, stale screen or failed photo edit → restore cover + menu.
     await delete_message_safe(callback)
-    if callback.message is None:
+    chat_id = _chat_id(callback)
+    bot = callback.bot
+    if bot is None or chat_id is None:
         return
-    msg = await callback.message.answer_photo(
+    msg = await bot.send_photo(
+        chat_id,
         photo=media,
         caption=caption,
         parse_mode=ParseMode.HTML,
         reply_markup=markup,
     )
     if msg.photo:
-        media_cache.set(WELCOME_CACHE_KEY, msg.photo[-1].file_id)
+        await media_cache.remember(WELCOME_CACHE_KEY, msg.photo[-1].file_id)

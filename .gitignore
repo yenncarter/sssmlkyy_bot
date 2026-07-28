@@ -2,12 +2,19 @@ venv/
 .env
 __pycache__/
 *.py[cod]
+*$py.class
 data/
 logs/
 *.db
 .bot.pid
 .idea/
 .vscode/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
 
 # Source originals (bot uses compressed cover.jpg)
 images/welcome/SS.JPG

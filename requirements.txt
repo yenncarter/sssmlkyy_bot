@@ -6,4 +6,6 @@ greenlet==3.2.3
 aiosqlite==0.21.0
 asyncpg==0.30.0
 apscheduler==3.10.4
-Pillow>=10.0.0
+# The whole schedule is computed in Europe/Moscow; slim base images do not
+# always ship /usr/share/zoneinfo, and ZoneInfo would then fail at import.
+tzdata==2026.3

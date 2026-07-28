@@ -4,6 +4,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from callbacks.factories import (
+    AdminCallback,
     BookCancelCallback,
     BookDayCallback,
     BookNavCallback,
@@ -90,8 +91,6 @@ def days_keyboard(
             ),
         )
     elif back_to_admin:
-        from callbacks.factories import AdminCallback
-
         if booking_id:
             builder.row(
                 InlineKeyboardButton(
@@ -144,8 +143,6 @@ def slots_keyboard(
             ),
         )
     elif booking_id is not None:
-        from callbacks.factories import AdminCallback
-
         builder.row(
             InlineKeyboardButton(
                 text=BTN_BACK,

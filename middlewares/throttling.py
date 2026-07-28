@@ -3,27 +3,54 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import Any
 
 from aiogram import BaseMiddleware
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 
-from config.constants import THROTTLE_RATE, THROTTLE_TTL_SECONDS
+from config.constants import (
+    THROTTLE_BURST,
+    THROTTLE_MIN_INTERVAL,
+    THROTTLE_REFILL_SECONDS,
+    THROTTLE_TTL_SECONDS,
+)
 from presentation.texts.messages import THROTTLE
 
 
+@dataclass(slots=True)
+class _Budget:
+    tokens: float
+    updated_at: float
+
+
 class ThrottlingMiddleware(BaseMiddleware):
-    """Drop rapid-fire spam without punishing normal UX."""
+    """Drop rapid-fire spam without punishing normal UX.
+
+    Two independent limits, because they solve different problems:
+
+    * `min_interval` swallows accidental double taps on the same button;
+    * a token bucket bounds the *sustained* rate. Every screen costs database
+      work on a single-writer SQLite file, so an unbounded stream of taps from
+      one chat would otherwise degrade the bot for everyone else.
+    """
 
     def __init__(
         self,
-        rate: float = THROTTLE_RATE,
+        min_interval: float = THROTTLE_MIN_INTERVAL,
+        burst: int = THROTTLE_BURST,
+        refill_seconds: float = THROTTLE_REFILL_SECONDS,
         ttl: float = THROTTLE_TTL_SECONDS,
     ) -> None:
-        self._rate = rate
+        self._min_interval = min_interval
+        self._burst = max(1, burst)
+        self._refill = max(0.05, refill_seconds)
         self._ttl = ttl
-        self._last: dict[int, float] = {}
+        self._budgets: dict[int, _Budget] = {}
         self._last_cleanup = time.monotonic()
 
     async def __call__(
@@ -40,21 +67,37 @@ class ThrottlingMiddleware(BaseMiddleware):
         now = time.monotonic()
         self._maybe_cleanup(now)
 
-        if now - self._last.get(uid, 0.0) < self._rate:
+        if not self._allow(uid, now):
             await _feedback(target, data)
             return None
 
-        self._last[uid] = now
         return await handler(event, data)
+
+    def _allow(self, uid: int, now: float) -> bool:
+        budget = self._budgets.get(uid)
+        if budget is None:
+            self._budgets[uid] = _Budget(tokens=self._burst - 1, updated_at=now)
+            return True
+
+        elapsed = now - budget.updated_at
+        if elapsed < self._min_interval:
+            return False
+
+        budget.tokens = min(self._burst, budget.tokens + elapsed / self._refill)
+        budget.updated_at = now
+        if budget.tokens < 1:
+            return False
+        budget.tokens -= 1
+        return True
 
     def _maybe_cleanup(self, now: float) -> None:
         if now - self._last_cleanup < self._ttl:
             return
         self._last_cleanup = now
         cutoff = now - self._ttl
-        stale = [uid for uid, ts in self._last.items() if ts < cutoff]
+        stale = [uid for uid, b in self._budgets.items() if b.updated_at < cutoff]
         for uid in stale:
-            del self._last[uid]
+            del self._budgets[uid]
 
 
 def _unwrap(event: TelegramObject) -> TelegramObject:
@@ -76,10 +119,9 @@ def _user_id(event: TelegramObject) -> int | None:
 
 async def _feedback(event: TelegramObject, data: dict[str, Any]) -> None:
     if isinstance(event, CallbackQuery):
-        try:
+        # Stop the spinner; a throttled tap needs no explanation.
+        with suppress(TelegramAPIError):
             await event.answer()
-        except Exception:
-            pass
         return
 
     if not isinstance(event, Message):
@@ -93,5 +135,5 @@ async def _feedback(event: TelegramObject, data: dict[str, Any]) -> None:
         if await state.get_state() is None:
             return
         await event.answer(THROTTLE)
-    except Exception:
+    except TelegramAPIError:
         pass

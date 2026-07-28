@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject
@@ -40,10 +41,15 @@ def _user_id(event: TelegramObject) -> str:
 
 
 def _detail(event: TelegramObject) -> str:
+    """Never log message bodies.
+
+    Clients type their name and phone number into this bot; those would end up
+    in plain-text log files and in the hosting panel. Shape is enough to debug.
+    """
     if isinstance(event, CallbackQuery):
         return f"cb={event.data!r}"
     if isinstance(event, Message):
         if event.text:
-            return f"text={event.text[:40]!r}"
+            return f"text_len={len(event.text)}"
         return f"content={event.content_type}"
     return ""

@@ -1,40 +1,50 @@
-"""Make a consistent SQLite backup (checkpoint WAL) and print inventory."""
+"""Make a verified SQLite backup on demand and print an inventory.
+
+Same code path as the nightly job in the bot (services/backup_service.py), so a
+manual backup is never subtly different from an automatic one.
+
+    python scripts/backup_and_dump_sqlite.py
+"""
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
-from datetime import datetime
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "data" / "bot.db"
-BACKUP_DIR = ROOT / "data" / "backups"
+sys.path.insert(0, str(ROOT))
+
+from config.settings import reload_settings
+from services.backup_service import (
+    BackupError,
+    backup_dir_for,
+    create_backup,
+    pretty_size,
+)
 
 
 def main() -> None:
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = BACKUP_DIR / f"bot_consistent_{ts}.db"
+    settings = reload_settings()
+    db_path = settings.sqlite_path
+    if db_path is None:
+        print(f"Не SQLite ({settings.database_url.split('://')[0]}) — бэкап не нужен.")
+        raise SystemExit(1)
 
-    con = sqlite3.connect(SRC)
-    con.execute("PRAGMA wal_checkpoint(FULL)")
-    con.close()
+    try:
+        result = create_backup(db_path, backup_dir_for(db_path))
+    except BackupError as exc:
+        print(f"Бэкап не сделан: {exc}")
+        raise SystemExit(1) from exc
 
-    shutil.copy2(SRC, dst)
+    print(f"backup={result.path}")
+    print(f"size={pretty_size(result.size)}")
+    print(f"days={result.days} bookings={result.bookings} active={result.active}")
+    _print_active(result.path)
 
-    con = sqlite3.connect(dst)
-    days = con.execute("SELECT COUNT(*) FROM working_days").fetchone()[0]
-    bookings = con.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
-    active = con.execute(
-        "SELECT COUNT(*) FROM bookings WHERE status='active'"
-    ).fetchone()[0]
-    print(f"backup={dst}")
-    print(f"size={dst.stat().st_size}")
-    print(f"days={days} bookings={bookings} active={active}")
 
-    print("---ACTIVE---")
-    q = """
+def _print_active(path: Path) -> None:
+    query = """
     SELECT b.id, wd.day, s.start_time, b.full_name, b.phone, b.username
     FROM bookings b
     JOIN slots s ON s.id = b.slot_id
@@ -42,9 +52,13 @@ def main() -> None:
     WHERE b.status = 'active'
     ORDER BY wd.day, s.start_time
     """
-    for row in con.execute(q):
-        print("|".join("" if x is None else str(x) for x in row))
-    con.close()
+    print("---ACTIVE---")
+    con = sqlite3.connect(str(path))
+    try:
+        for row in con.execute(query):
+            print("|".join("" if value is None else str(value) for value in row))
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":

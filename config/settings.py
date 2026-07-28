@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-import os
 
 from dotenv import load_dotenv
 
@@ -18,7 +18,7 @@ BOTHOST_DATA_DIR = Path("/app/data")
 BOTHOST_SQLITE_URL = "sqlite+aiosqlite:////app/data/bot.db"
 
 
-def _running_on_bothost_or_docker() -> bool:
+def running_in_container() -> bool:
     if Path("/.dockerenv").exists():
         return True
     if BOTHOST_DATA_DIR.is_dir():
@@ -28,7 +28,7 @@ def _running_on_bothost_or_docker() -> bool:
 
 
 def _default_sqlite_url() -> str:
-    if _running_on_bothost_or_docker():
+    if running_in_container():
         BOTHOST_DATA_DIR.mkdir(parents=True, exist_ok=True)
         return BOTHOST_SQLITE_URL
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,17 +42,20 @@ def _normalize_database_url(raw: str) -> str:
         return url.replace("postgres://", "postgresql+asyncpg://", 1)
     if url.startswith("postgresql://"):
         return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if "sqlite" in url and _running_on_bothost_or_docker():
+    if "sqlite" in url and running_in_container():
         # Any sqlite URL in container → /app/data/bot.db (volume).
         BOTHOST_DATA_DIR.mkdir(parents=True, exist_ok=True)
         return BOTHOST_SQLITE_URL
     return url
 
+# Local development convenience only. Real deployments (Bothost) set variables
+# in the panel, and those must win — a stale .env baked into an image silently
+# overriding production secrets is exactly the failure mode to avoid.
 load_dotenv(BASE_DIR / ".env", override=False)
 
 
-def _env_prefer_file(key: str, env_file_values: dict[str, str]) -> str:
-    return (env_file_values.get(key) or os.getenv(key) or "").strip().strip('"').strip("'")
+def _env(key: str) -> str:
+    return (os.getenv(key) or "").strip().strip('"').strip("'")
 
 
 def _parse_admin_ids(raw: str) -> tuple[int, ...]:
@@ -83,7 +86,6 @@ class Settings:
     """Immutable application settings."""
 
     bot_token: str
-    channel_id: str | int
     channel_link: str
     master_username: str
     master_phone: str
@@ -113,6 +115,15 @@ class Settings:
         return bool(self.admin_telegram_ids)
 
     @property
+    def sqlite_path(self) -> Path | None:
+        """Filesystem path of the SQLite file, or None for other backends."""
+        marker = ":///"
+        if "sqlite" not in self.database_url:
+            return None
+        _, _, tail = self.database_url.partition(marker)
+        return Path(tail) if tail else None
+
+    @property
     def primary_admin_id(self) -> int | None:
         """Master's Telegram id — first entry in ADMIN_TELEGRAM_IDS."""
         return self.admin_telegram_ids[0] if self.admin_telegram_ids else None
@@ -137,18 +148,6 @@ class Settings:
         if not master_username:
             raise ValueError("MASTER_USERNAME is not set in environment")
 
-        channel_id_raw = os.getenv("CHANNEL_ID", "").strip()
-        if not channel_id_raw:
-            raise ValueError("CHANNEL_ID is not set in environment")
-        if channel_id_raw.lstrip("-").isdigit():
-            channel_id: str | int = int(channel_id_raw)
-        else:
-            channel_id = (
-                channel_id_raw
-                if channel_id_raw.startswith("@")
-                else f"@{channel_id_raw}"
-            )
-
         timeout_raw = os.getenv("REQUEST_TIMEOUT", "120").strip()
         try:
             request_timeout = int(timeout_raw)
@@ -157,21 +156,8 @@ class Settings:
         if request_timeout < 10:
             raise ValueError("REQUEST_TIMEOUT must be >= 10")
 
-        # Prefer .env file over stale process/user environment variables.
-        env_file_values: dict[str, str] = {}
-        try:
-            from dotenv import dotenv_values
-
-            env_file_values = {
-                k: v
-                for k, v in dotenv_values(BASE_DIR / ".env").items()
-                if v is not None
-            }
-        except Exception:
-            env_file_values = {}
-
-        ids_raw = _env_prefer_file("ADMIN_TELEGRAM_IDS", env_file_values)
-        single = _env_prefer_file("ADMIN_TELEGRAM_ID", env_file_values)
+        ids_raw = _env("ADMIN_TELEGRAM_IDS")
+        single = _env("ADMIN_TELEGRAM_ID")
         # Prefer ADMIN_TELEGRAM_IDS as the source of truth (order = primary first).
         # Legacy ADMIN_TELEGRAM_ID is appended only if missing from the list.
         if not ids_raw:
@@ -200,14 +186,13 @@ class Settings:
             raise ValueError("SLOT_HOLD_MINUTES must be an integer") from exc
 
         # Ensure local data dir exists; on Bothost volume is /app/data.
-        if "sqlite" in database_url and _running_on_bothost_or_docker():
+        if "sqlite" in database_url and running_in_container():
             BOTHOST_DATA_DIR.mkdir(parents=True, exist_ok=True)
         else:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         return cls(
             bot_token=bot_token,
-            channel_id=channel_id,
             channel_link=channel_link,
             master_username=master_username,
             master_phone=os.getenv("MASTER_PHONE", "").strip() or "+7 777 666-44-44",
@@ -230,11 +215,6 @@ def get_settings() -> Settings:
 
 
 def reload_settings() -> Settings:
-    """Drop cache and reload settings (e.g. after .env change)."""
+    """Drop the cache and reload (scripts that patch os.environ first)."""
     get_settings.cache_clear()
-    global settings
-    settings = get_settings()
-    return settings
-
-
-settings = get_settings()
+    return get_settings()

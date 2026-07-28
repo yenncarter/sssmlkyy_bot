@@ -2,13 +2,32 @@
 
 from __future__ import annotations
 
+import logging
+from datetime import date
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from callbacks.factories import AdminCallback
-from db.models import Booking, WorkingDay
+from db.models import Booking, Slot, WorkingDay
 from domain.dates import format_date_short, format_time, weekday_short
+from domain.enums import BookingStatus, SlotStatus
 from presentation.texts.messages import BTN_BACK
+
+logger = logging.getLogger("beauty_bot.keyboards")
+
+# Telegram rejects inline keyboards with ~100+ rows. Stay below that, and shout
+# when a list is actually cut off instead of hiding rows silently.
+MAX_LIST_ROWS = 90
+
+
+def _limited(items: list, what: str) -> list:
+    if len(items) > MAX_LIST_ROWS:
+        logger.warning(
+            "Список «%s» обрезан: %s из %s", what, MAX_LIST_ROWS, len(items)
+        )
+        return items[:MAX_LIST_ROWS]
+    return items
 
 
 def _back(action: str, item_id: int = 0) -> InlineKeyboardButton:
@@ -44,6 +63,12 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
             callback_data=AdminCallback(action="client_menu").pack(),
         ),
     )
+    builder.row(
+        InlineKeyboardButton(
+            text="🛠 Состояние бота",
+            callback_data=AdminCallback(action="status").pack(),
+        ),
+    )
     return builder.as_markup()
 
 
@@ -68,9 +93,9 @@ def admin_schedule_hub_keyboard(*, days_count: int) -> InlineKeyboardMarkup:
 
 def admin_days_list_keyboard(days: list[WorkingDay]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for day in days[:40]:
+    for day in _limited(days, "дни графика"):
         custom = bool(day.open_time or day.close_time or day.slot_minutes)
-        free = sum(1 for s in day.slots if s.status == "free")
+        free = sum(1 for s in day.slots if s.status == SlotStatus.FREE.value)
         star = "★ " if custom else ""
         wd = weekday_short(day.day)
         builder.row(
@@ -89,20 +114,23 @@ def admin_days_list_keyboard(days: list[WorkingDay]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def admin_day_keyboard(day_id: int, slots: list | None = None) -> InlineKeyboardMarkup:
+_SLOT_LABEL_PREFIX = {
+    SlotStatus.BOOKED.value: "🔒 ",
+    SlotStatus.BLOCKED.value: "✕ ",
+    SlotStatus.HELD.value: "⏳ ",
+}
+
+
+def admin_day_keyboard(
+    day_id: int,
+    slots: list[Slot] | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if slots:
         row: list[InlineKeyboardButton] = []
-        for s in slots:
+        for s in _limited(list(slots), "слоты дня"):
             t = format_time(s.start_time)
-            if s.status == "booked":
-                label = f"🔒 {t}"
-            elif s.status == "blocked":
-                label = f"✕ {t}"
-            elif s.status == "held":
-                label = f"⏳ {t}"
-            else:
-                label = t
+            label = f"{_SLOT_LABEL_PREFIX.get(s.status, '')}{t}"
             row.append(
                 InlineKeyboardButton(
                     text=label,
@@ -177,17 +205,11 @@ def admin_back_settings_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def admin_back_day_keyboard(day_id: int) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(_back("day", day_id))
-    return builder.as_markup()
-
-
 def admin_bookings_days_keyboard(
-    day_items: list[tuple[int, object, int]],
+    day_items: list[tuple[int, date, int]],
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for day_id, day_date, count in day_items:
+    for day_id, day_date, count in _limited(day_items, "дни с записями"):
         builder.row(
             InlineKeyboardButton(
                 text=f"📅 {format_date_short(day_date)} · {count}",
@@ -242,10 +264,10 @@ def admin_hours_keyboard() -> InlineKeyboardMarkup:
 
 def admin_bookings_keyboard(bookings: list[Booking]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for b in bookings[:25]:
+    for b in _limited(bookings, "записи"):
         day = b.slot.working_day.day
         t = b.slot.start_time
-        mark = "⏳ " if b.status == "pending_payment" else ""
+        mark = "⏳ " if b.status == BookingStatus.PENDING_PAYMENT.value else ""
         builder.row(
             InlineKeyboardButton(
                 text=f"{mark}{format_date_short(day)} {format_time(t)} · {b.full_name}",

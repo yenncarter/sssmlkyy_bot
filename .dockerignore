@@ -1,4 +1,4 @@
-# Keep secrets and local junk out of Docker/Fly images
+# Keep secrets and local junk out of Docker images
 .env
 .env.*
 !.env.example
@@ -11,6 +11,9 @@ logs/
 .bot.pid
 __pycache__/
 *.py[cod]
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
 .idea/
 .vscode/
 .git/

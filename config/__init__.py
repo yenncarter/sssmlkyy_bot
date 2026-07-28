@@ -1,13 +1,6 @@
-"""Configuration package."""
+"""Configuration package.
 
-from config.constants import CallbackAction
-from config.settings import BASE_DIR, PORTFOLIO_DIR, Settings, get_settings, settings
-
-__all__ = [
-    "BASE_DIR",
-    "CallbackAction",
-    "PORTFOLIO_DIR",
-    "Settings",
-    "get_settings",
-    "settings",
-]
+Import from the modules directly (`from config.settings import Settings`): the
+re-export facade that used to live here only added an import-time dependency
+from config onto the domain layer.
+"""

@@ -22,6 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.base import Base
+from domain.dates import now_local
 from domain.enums import BookingStatus, SlotStatus
 
 
@@ -42,6 +43,47 @@ class WorkSettings(Base):
     )
 
 
+class AppState(Base):
+    """Key/value store for operational state that must survive a restart.
+
+    Bothost redeploys the container on every push, so anything kept only in
+    process memory (watermarks, last backup time) is lost exactly when it is
+    needed most.
+    """
+
+    __tablename__ = "app_state"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=now_local,
+        onupdate=now_local,
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+class MediaFile(Base):
+    """Telegram file_id for a local asset.
+
+    Without this the bot re-uploads every portfolio photo from disk after each
+    restart — seconds of latency on the first swipe, for no reason.
+    """
+
+    __tablename__ = "media_files"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    file_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=now_local,
+        onupdate=now_local,
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
 class WorkingDay(Base):
     __tablename__ = "working_days"
 
@@ -50,8 +92,11 @@ class WorkingDay(Base):
     open_time: Mapped[time | None] = mapped_column(Time, nullable=True)
     close_time: Mapped[time | None] = mapped_column(Time, nullable=True)
     slot_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Python-side default: SQLite's CURRENT_TIMESTAMP is UTC, which would put
+    # created_at 3 hours behind every other timestamp in the schema.
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=now_local,
         server_default=func.now(),
         nullable=False,
     )
@@ -87,16 +132,33 @@ class Slot(Base):
     held_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     working_day: Mapped[WorkingDay] = relationship(back_populates="slots")
-    bookings: Mapped[list[Booking]] = relationship(back_populates="slot")
+    # passive_deletes="all": never let the ORM "detach" bookings by writing NULL
+    # into the NOT NULL slot_id. Callers must remove bookings explicitly; the FK
+    # (RESTRICT) then fails loudly instead of corrupting a row.
+    bookings: Mapped[list[Booking]] = relationship(
+        back_populates="slot",
+        passive_deletes="all",
+    )
 
 
 class Booking(Base):
     __tablename__ = "bookings"
+    # NOTE: indexes here only materialize for a freshly created table.
+    # db.session.init_db issues the equivalent CREATE INDEX IF NOT EXISTS so
+    # that databases predating them get the constraints too.
     __table_args__ = (
         Index("ix_bookings_user_status", "telegram_user_id", "status"),
+        Index("ix_bookings_status", "status"),
         Index(
             "uq_live_booking_slot",
             "slot_id",
+            unique=True,
+            sqlite_where=text("status IN ('pending_payment', 'active')"),
+            postgresql_where=text("status IN ('pending_payment', 'active')"),
+        ),
+        Index(
+            "uq_live_booking_user",
+            "telegram_user_id",
             unique=True,
             sqlite_where=text("status IN ('pending_payment', 'active')"),
             postgresql_where=text("status IN ('pending_payment', 'active')"),
@@ -133,6 +195,7 @@ class Booking(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=now_local,
         server_default=func.now(),
         nullable=False,
     )

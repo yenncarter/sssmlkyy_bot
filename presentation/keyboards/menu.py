@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from callbacks.factories import MenuCallback
-from config.settings import Settings, settings as default_settings
+from config.settings import Settings
 from domain.enums import CallbackAction
 from presentation.texts.messages import (
     BTN_ABOUT,
@@ -17,18 +17,11 @@ from presentation.texts.messages import (
     BTN_MY_BOOKINGS,
     BTN_PORTFOLIO,
     BTN_PRICE,
-    BTN_SUBSCRIBE,
 )
 
 
-def channel_button(settings: Settings | None = None) -> InlineKeyboardButton:
-    cfg = settings or default_settings
-    return InlineKeyboardButton(text=BTN_SUBSCRIBE, url=cfg.channel_link)
-
-
-def menu_channel_button(settings: Settings | None = None) -> InlineKeyboardButton:
-    cfg = settings or default_settings
-    return InlineKeyboardButton(text=BTN_CHANNEL, url=cfg.channel_link)
+def menu_channel_button(settings: Settings) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=BTN_CHANNEL, url=settings.channel_link)
 
 
 def back_button() -> InlineKeyboardButton:
@@ -44,7 +37,7 @@ def footer_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def main_menu_keyboard(settings: Settings | None = None) -> InlineKeyboardMarkup:
+def main_menu_keyboard(settings: Settings) -> InlineKeyboardMarkup:
     """Primary CTA full-width, then comfortable 2-column rows."""
     builder = InlineKeyboardBuilder()
     builder.row(

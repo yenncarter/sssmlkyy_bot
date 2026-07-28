@@ -8,6 +8,7 @@ from aiogram.types import Message
 from config.settings import Settings
 from presentation.keyboards.admin import admin_home_keyboard
 from presentation.keyboards.reply import START_BUTTON_ALIASES
+from presentation.texts.messages import ADMIN_HOME
 from presentation.ui.screens import send_welcome
 from services.media_cache import MediaCache
 from services.session import SessionService
@@ -25,15 +26,13 @@ async def cmd_start(
     state: FSMContext,
 ) -> None:
     await state.clear()
-    if message.from_user:
-        session.mark_started(message.from_user.id)
+    user_id = message.from_user.id if message.from_user else None
+    if user_id is not None:
+        session.mark_started(user_id)
 
-    if settings.is_admin(message.from_user.id if message.from_user else None):
-        from presentation.texts.messages import ADMIN_HOME
-
+    if settings.is_admin(user_id):
         await message.answer(
-            ADMIN_HOME
-            + f"\n\nID: <code>{message.from_user.id}</code>",  # type: ignore[union-attr]
+            ADMIN_HOME + f"\n\nID: <code>{user_id}</code>",
             reply_markup=admin_home_keyboard(),
         )
         return

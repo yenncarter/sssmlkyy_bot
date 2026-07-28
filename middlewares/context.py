@@ -1,6 +1,7 @@
 """Bot context middleware — inject container services."""
 
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
@@ -21,11 +22,11 @@ class BotContextMiddleware(BaseMiddleware):
         c = self._container
         data["container"] = c
         data["settings"] = c.settings
-        data["subscription"] = c.subscription
         data["portfolio"] = c.portfolio
         data["session"] = c.session
         data["media_cache"] = c.media_cache
         data["schedule"] = c.schedule
         data["bookings"] = c.bookings
         data["notify"] = c.notify
+        data["db_health"] = c.db_health
         return await handler(event, data)

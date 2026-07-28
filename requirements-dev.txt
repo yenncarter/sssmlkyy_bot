@@ -1,0 +1,5 @@
+# Development-only dependencies. Not installed in the production image.
+# Pillow is used solely by scripts/prepare_images.py.
+Pillow>=10.0.0
+ruff==0.16.0
+mypy==2.3.0

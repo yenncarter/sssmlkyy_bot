@@ -1,36 +1,36 @@
-"""Date and time helpers (Europe/Moscow — matches master's phone clock)."""
+"""Date and time helpers.
 
-from datetime import date, datetime, time, timedelta
+The bot has exactly one clock: Europe/Moscow — the master's phone time.
+Every datetime that crosses the persistence boundary must go through
+:func:`now_local` / :func:`to_local`, because SQLite silently drops the UTC
+offset on write (values come back naive) while Postgres returns aware UTC.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
-# Master lives in Samara, but local phone/calendar runs on Moscow time (UTC+3).
 LOCAL_TZ = ZoneInfo("Europe/Moscow")
-SAMARA_TZ = LOCAL_TZ  # back-compat alias used across the codebase
-MOSCOW_TZ = LOCAL_TZ
 
-# How far ahead the calendar will allow booking once scheduling ships.
-CALENDAR_DAYS_AHEAD: int = 30
+
+def now_local() -> datetime:
+    """Current moment on the bot clock."""
+    return datetime.now(LOCAL_TZ)
+
+
+def to_local(value: datetime | None) -> datetime | None:
+    """Normalize a stored datetime to an aware bot-clock datetime."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=LOCAL_TZ)
+    return value.astimezone(LOCAL_TZ)
 
 
 def today() -> date:
-    """Current date on the bot clock (Moscow / phone time)."""
-    return datetime.now(LOCAL_TZ).date()
-
-
-def max_calendar_date() -> date:
-    """Last selectable calendar date for future booking UI."""
-    return today() + timedelta(days=CALENDAR_DAYS_AHEAD)
-
-
-def is_date_in_range(target: date) -> bool:
-    """Whether date falls into the bookable window."""
-    return today() <= target <= max_calendar_date()
-
-
-def parse_time(value: str) -> time:
-    """Parse HH:MM into time."""
-    hours, minutes = value.split(":")
-    return time(int(hours), int(minutes))
+    """Current date on the bot clock."""
+    return now_local().date()
 
 
 def format_date(d: date) -> str:
@@ -62,5 +62,5 @@ def format_time(t: time) -> str:
 
 
 def combine_datetime(d: date, t: time) -> datetime:
-    """Combine date + time into timezone-aware bot datetime."""
+    """Combine date + time into an aware bot-clock datetime."""
     return datetime.combine(d, t, tzinfo=LOCAL_TZ)

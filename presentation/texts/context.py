@@ -2,30 +2,36 @@
 
 from string import Formatter
 
-from config.settings import Settings, settings as default_settings
+from config.settings import Settings
 
 
-def text_context(settings: Settings | None = None, **extra: str) -> dict[str, str]:
-    """Build placeholder dict for message templates."""
-    cfg = settings or default_settings
+class _KeepMissing(dict):
+    """Leave unknown placeholders as-is instead of raising KeyError."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def text_context(settings: Settings, **extra: str) -> dict[str, str]:
+    """Build the placeholder dict for message templates."""
     base = {
-        "master_name": cfg.master_name,
-        "master_username": cfg.master_username,
-        "master_phone": cfg.master_phone,
-        "channel_link": cfg.channel_link,
-        "channel_name": cfg.channel_name,
-        "payment_link": cfg.payment_link,
+        "master_name": settings.master_name,
+        "master_username": settings.master_username,
+        "master_phone": settings.master_phone,
+        "channel_link": settings.channel_link,
+        "channel_name": settings.channel_name,
+        "payment_link": settings.payment_link,
     }
     base.update(extra)
     return base
 
 
-def format_message(
-    template: str,
-    settings: Settings | None = None,
-    **extra: str,
-) -> str:
-    """Format only placeholders that exist in the template."""
+def format_message(template: str, settings: Settings, **extra: str) -> str:
+    """Substitute known placeholders; leave the rest untouched.
+
+    Several templates carry booking-specific fields (`{date}`, `{time}`, …)
+    that the caller fills in later, so a missing key must not be fatal.
+    """
     keys = {
         field_name
         for _, field_name, _, _ in Formatter().parse(template)
@@ -33,5 +39,4 @@ def format_message(
     }
     if not keys:
         return template
-    data = text_context(settings, **extra)
-    return template.format(**{key: data[key] for key in keys})
+    return template.format_map(_KeepMissing(text_context(settings, **extra)))

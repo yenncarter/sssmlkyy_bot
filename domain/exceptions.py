@@ -13,10 +13,6 @@ class ValidationError(AppError):
     """Invalid user or admin input."""
 
 
-class NotSubscribedError(AppError):
-    """Channel subscription required."""
-
-
 class StaleCallbackError(AppError):
     """Callback data is outdated or invalid."""
 
@@ -25,23 +21,12 @@ class PermissionDeniedError(AppError):
     """Caller lacks required permissions."""
 
 
-class UserBlockedError(AppError):
-    """User is blocked from using the bot."""
-
-
-# --- Booking / schedule (next phase) ---
-
-
 class SlotNotAvailableError(AppError):
     """Time slot is already taken."""
 
 
 class SlotNotFoundError(AppError):
     """Time slot does not exist."""
-
-
-class DayClosedError(AppError):
-    """Working day is closed."""
 
 
 class DayNotFoundError(AppError):
@@ -58,18 +43,3 @@ class BookingNotFoundError(AppError):
 
 class DuplicateSlotError(AppError):
     """Slot with the same time already exists."""
-
-
-# --- Payments (next phase) ---
-
-
-class PaymentRequiredError(AppError):
-    """Prepayment is required before confirming the booking."""
-
-
-class PaymentNotFoundError(AppError):
-    """Payment / receipt was not found."""
-
-
-class InvalidReceiptError(AppError):
-    """Uploaded receipt failed validation."""

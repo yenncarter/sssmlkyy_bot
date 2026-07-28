@@ -9,10 +9,6 @@ class MenuCallback(CallbackData, prefix="menu"):
     action: CallbackAction
 
 
-class SubscriptionCallback(CallbackData, prefix="sub"):
-    action: CallbackAction
-
-
 class PortfolioCallback(CallbackData, prefix="pf"):
     action: CallbackAction
     page: int = 0
@@ -24,10 +20,6 @@ class BookDayCallback(CallbackData, prefix="bday"):
 
 class BookSlotCallback(CallbackData, prefix="bslot"):
     slot_id: int
-
-
-class BookServiceCallback(CallbackData, prefix="bsvc"):
-    code: str
 
 
 class BookCancelCallback(CallbackData, prefix="bcancel"):

@@ -1,5 +1,7 @@
 """Main menu handlers."""
 
+import logging
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
@@ -7,6 +9,7 @@ from aiogram.types import CallbackQuery
 from callbacks.factories import MenuCallback
 from config.settings import Settings
 from domain.enums import CallbackAction
+from domain.exceptions import BookingNotFoundError
 from presentation.keyboards.menu import (
     faq_hub_keyboard,
     faq_section_keyboard,
@@ -27,6 +30,7 @@ from services.media_cache import MediaCache
 from services.schedule_service import BookingService
 
 router = Router(name="menu")
+logger = logging.getLogger("beauty_bot.menu")
 
 
 @router.callback_query(MenuCallback.filter(F.action == CallbackAction.BACK))
@@ -41,10 +45,14 @@ async def back_to_menu(
     data = await state.get_data()
     booking_id = data.get("booking_id")
     if booking_id:
+        # Leaving the flow releases the hold. Navigation must work even if that
+        # fails — the hold expires on its own within SLOT_HOLD_MINUTES.
         try:
             await bookings.cancel_booking(booking_id)
-        except Exception:
+        except BookingNotFoundError:
             pass
+        except Exception:
+            logger.warning("Не удалось снять бронь %s при выходе", booking_id, exc_info=True)
     await state.clear()
     await show_main_menu(callback, settings, media_cache)
 

@@ -1,25 +1,28 @@
-"""Schedule and booking domain services."""
+"""Schedule and booking services.
+
+Concurrency note: `with_for_update()` is a no-op on SQLite (SQLAlchemy drops
+`FOR UPDATE`), so row locks must never be the only guard. Correctness relies on
+the partial unique indexes created in `db.session.init_db`:
+
+* `uq_live_booking_slot` — at most one live booking per slot;
+* `uq_live_booking_user` — at most one live booking per client.
+
+Both are enforced by the database and translated back into domain errors here.
+"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from math import ceil
-from time import monotonic
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from config.settings import Settings
-from db.models import Booking, Slot, WorkSettings, WorkingDay
-from domain.dates import (
-    SAMARA_TZ,
-    combine_datetime,
-    format_date,
-    format_date_short,
-    format_time,
-    today,
-)
+from db.models import Booking, Slot, WorkingDay, WorkSettings
+from domain.dates import combine_datetime, now_local, to_local, today
 from domain.enums import BookingStatus, SlotStatus
 from domain.exceptions import (
     AlreadyHasBookingError,
@@ -31,53 +34,42 @@ from domain.exceptions import (
     SlotNotFoundError,
     ValidationError,
 )
-from domain.services_catalog import Service, get_service
+from domain.slots import (
+    DEFAULT_CLOSE,
+    DEFAULT_OPEN,
+    DEFAULT_SLOT_MINUTES,
+    generate_slot_times,
+    slots_needed,
+)
+
+# Statuses that occupy a slot and block the client from booking again.
+LIVE_BOOKING_STATUSES = (
+    BookingStatus.PENDING_PAYMENT.value,
+    BookingStatus.ACTIVE.value,
+)
+BUSY_SLOT_STATUSES = frozenset(
+    {SlotStatus.BOOKED.value, SlotStatus.HELD.value}
+)
+# Upper bound for calendar screens — keeps a single query bounded.
+MAX_CALENDAR_DAYS = 90
+CLIENT_CANCEL_CUTOFF = timedelta(hours=24)
+# How long after a hold lapsed a receipt is still recognised as belonging to it.
+LATE_RECEIPT_GRACE = timedelta(hours=3)
 
 
-DEFAULT_OPEN = time(10, 0)
-DEFAULT_CLOSE = time(22, 0)
-DEFAULT_SLOT_MINUTES = 60
-# Hot paths call cleanup often; scheduler does a full pass every 2 min.
-_HOLD_CLEANUP_MIN_INTERVAL = 45.0
-_PAST_PURGE_MIN_INTERVAL = 60.0
+@dataclass(frozen=True, slots=True)
+class WorkHours:
+    """Immutable snapshot of the singleton work_settings row."""
 
-
-def _utcnow() -> datetime:
-    """«Now» on the bot clock (Moscow / phone time)."""
-    return datetime.now(tz=SAMARA_TZ)
-
-
-def _aware(dt: datetime | None) -> datetime | None:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=SAMARA_TZ)
-    return dt.astimezone(SAMARA_TZ)
-
-
-def generate_slot_times(
-    open_time: time,
-    close_time: time,
-    slot_minutes: int,
-) -> list[time]:
-    """Starts from open until the last start strictly before close."""
-    if slot_minutes < 15:
-        raise ValidationError("Шаг слота минимум 15 минут.")
-    if open_time >= close_time:
-        raise ValidationError("Время открытия должно быть раньше закрытия.")
-
-    times: list[time] = []
-    cursor = datetime.combine(date.today(), open_time)
-    end = datetime.combine(date.today(), close_time)
-    while cursor < end:
-        times.append(cursor.time())
-        cursor += timedelta(minutes=slot_minutes)
-    if not times:
-        raise ValidationError("В этом диапазоне не получается ни одного слота.")
-    return times
+    open_time: time
+    close_time: time
+    slot_minutes: int
+    prepayment_amount: str
 
 
 class ScheduleService:
+    """Working days, slot grid and salon-wide settings."""
+
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
@@ -85,10 +77,14 @@ class ScheduleService:
     ) -> None:
         self._sf = session_factory
         self._settings = settings
-        self._last_hold_cleanup = 0.0
-        self._last_past_purge = 0.0
+        self._work_hours: WorkHours | None = None
 
-    async def get_work_settings(self) -> WorkSettings:
+    # --- work settings -------------------------------------------------
+
+    async def get_work_settings(self) -> WorkHours:
+        """Cached: the row changes a few times a year, but is read constantly."""
+        if self._work_hours is not None:
+            return self._work_hours
         async with self._sf() as session:
             row = await session.get(WorkSettings, 1)
             if row is None:
@@ -100,40 +96,44 @@ class ScheduleService:
                 )
                 session.add(row)
                 await session.commit()
-                await session.refresh(row)
-            return row
+            self._work_hours = _snapshot(row)
+            return self._work_hours
 
     async def set_work_settings(
         self,
         open_time: time,
         close_time: time,
         slot_minutes: int,
-    ) -> WorkSettings:
+    ) -> WorkHours:
         generate_slot_times(open_time, close_time, slot_minutes)  # validate
         async with self._sf() as session:
             row = await session.get(WorkSettings, 1)
             if row is None:
-                row = WorkSettings(id=1)
+                row = WorkSettings(id=1, prepayment_amount="1 000 ₽")
                 session.add(row)
             row.open_time = open_time
             row.close_time = close_time
             row.slot_minutes = slot_minutes
             await session.commit()
-            await session.refresh(row)
-            return row
+            self._work_hours = _snapshot(row)
+            return self._work_hours
 
-    async def _effective_hours(
-        self,
-        day: WorkingDay | None = None,
-    ) -> tuple[time, time, int]:
-        ws = await self.get_work_settings()
-        if day is None:
-            return ws.open_time, ws.close_time, ws.slot_minutes
-        return (
-            day.open_time or ws.open_time,
-            day.close_time or ws.close_time,
-            day.slot_minutes or ws.slot_minutes,
-        )
+    async def set_prepayment_amount(self, amount: str) -> WorkHours:
+        """`amount` must already be normalized by domain.parsing."""
+        async with self._sf() as session:
+            row = await session.get(WorkSettings, 1)
+            if row is None:
+                raise ValidationError("Настройки не найдены.")
+            row.prepayment_amount = amount
+            await session.commit()
+            self._work_hours = _snapshot(row)
+            return self._work_hours
+
+    def cached_work_hours(self) -> WorkHours | None:
+        """Snapshot without I/O — lets callers avoid opening a nested session."""
+        return self._work_hours
+
+    # --- days ----------------------------------------------------------
 
     async def add_day_with_times(
         self,
@@ -151,90 +151,43 @@ class ScheduleService:
 
         unique_times = sorted(set(times))
         async with self._sf() as session:
-            existing = await session.scalar(
-                select(WorkingDay).where(WorkingDay.day == day).options(
-                    selectinload(WorkingDay.slots)
-                )
+            exists = await session.scalar(
+                select(WorkingDay.id).where(WorkingDay.day == day)
             )
-            if existing is not None:
-                # Do not merge default hours into an existing day (would corrupt
-                # custom day hours). Caller treats this as "already exists".
+            if exists is not None:
+                # Never merge default hours into an existing day — it would
+                # silently overwrite the master's custom hours.
                 raise DuplicateSlotError("Этот день уже есть в графике.")
 
-            existing = WorkingDay(
+            created = WorkingDay(
                 day=day,
                 open_time=open_time,
                 close_time=close_time,
                 slot_minutes=slot_minutes,
             )
-            session.add(existing)
+            session.add(created)
             await session.flush()
-
-            for t in unique_times:
+            for start in unique_times:
                 session.add(
                     Slot(
-                        working_day_id=existing.id,
-                        start_time=t,
+                        working_day_id=created.id,
+                        start_time=start,
                         status=SlotStatus.FREE.value,
                     )
                 )
-            day_id = existing.id
-            await session.commit()
+            day_id = created.id
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise DuplicateSlotError("Этот день уже есть в графике.") from exc
 
-        async with self._sf() as session:
-            result = await session.scalar(
-                select(WorkingDay)
-                .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
-            )
-            assert result is not None
-            return result
+        return await self.get_day(day_id)
 
     async def add_day_from_defaults(self, day: date) -> WorkingDay:
-        open_t, close_t, step = await self._effective_hours()
-        times = generate_slot_times(open_t, close_t, step)
+        ws = await self.get_work_settings()
+        times = generate_slot_times(ws.open_time, ws.close_time, ws.slot_minutes)
         return await self.add_day_with_times(day, times)
-
-    async def fill_days(
-        self,
-        days: list[date],
-        *,
-        weekdays_only: bool = False,
-    ) -> tuple[int, int]:
-        """Create days with default hours. Returns (created, skipped)."""
-        created = 0
-        skipped = 0
-        for day in days:
-            if weekdays_only and day.weekday() >= 5:
-                continue
-            if day < today():
-                continue
-            try:
-                await self.add_day_from_defaults(day)
-                created += 1
-            except DuplicateSlotError:
-                skipped += 1
-            except ValidationError:
-                skipped += 1
-        return created, skipped
-
-    async def fill_next_n_days(self, n: int, *, weekdays_only: bool = False) -> tuple[int, int]:
-        start = today()
-        days = [start + timedelta(days=i) for i in range(n)]
-        return await self.fill_days(days, weekdays_only=weekdays_only)
-
-    async def fill_rest_of_month(self, *, weekdays_only: bool = False) -> tuple[int, int]:
-        start = today()
-        if start.month == 12:
-            end = date(start.year + 1, 1, 1) - timedelta(days=1)
-        else:
-            end = date(start.year, start.month + 1, 1) - timedelta(days=1)
-        days: list[date] = []
-        cur = start
-        while cur <= end:
-            days.append(cur)
-            cur += timedelta(days=1)
-        return await self.fill_days(days, weekdays_only=weekdays_only)
 
     async def set_day_hours(
         self,
@@ -247,286 +200,154 @@ class ScheduleService:
     ) -> WorkingDay:
         times = generate_slot_times(open_time, close_time, slot_minutes)
         async with self._sf() as session:
-            day = await session.scalar(
-                select(WorkingDay)
-                .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
-            )
-            if day is None:
-                raise DayNotFoundError("День не найден.")
-
+            day = await self._load_day(session, day_id)
             day.open_time = open_time
             day.close_time = close_time
             day.slot_minutes = slot_minutes
-
             if rebuild_free_slots:
-                keep_times = {
-                    s.start_time
-                    for s in day.slots
-                    if s.status in {SlotStatus.BOOKED.value, SlotStatus.HELD.value}
-                }
-                for s in list(day.slots):
-                    if s.status == SlotStatus.FREE.value:
-                        await session.delete(s)
-                await session.flush()
-                for t in times:
-                    if t in keep_times:
-                        continue
-                    session.add(
-                        Slot(
-                            working_day_id=day.id,
-                            start_time=t,
-                            status=SlotStatus.FREE.value,
-                        )
-                    )
+                await self._rebuild_free_slots(session, day, times)
             await session.commit()
-            day_id = day.id
-
-        async with self._sf() as session:
-            result = await session.scalar(
-                select(WorkingDay)
-                .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
-            )
-            assert result is not None
-            return result
+        return await self.get_day(day_id)
 
     async def clear_day_override(self, day_id: int) -> WorkingDay:
         """Reset day to global defaults and rebuild free slots."""
         ws = await self.get_work_settings()
         times = generate_slot_times(ws.open_time, ws.close_time, ws.slot_minutes)
         async with self._sf() as session:
-            day = await session.scalar(
-                select(WorkingDay)
-                .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
-            )
-            if day is None:
-                raise DayNotFoundError("День не найден.")
+            day = await self._load_day(session, day_id)
             day.open_time = None
             day.close_time = None
             day.slot_minutes = None
-            keep = {
-                s.start_time
-                for s in day.slots
-                if s.status in {SlotStatus.BOOKED.value, SlotStatus.HELD.value}
-            }
-            for s in list(day.slots):
-                if s.status == SlotStatus.FREE.value:
-                    await session.delete(s)
-            await session.flush()
-            for t in times:
-                if t in keep:
-                    continue
-                session.add(
-                    Slot(
-                        working_day_id=day.id,
-                        start_time=t,
-                        status=SlotStatus.FREE.value,
-                    )
-                )
+            await self._rebuild_free_slots(session, day, times)
             await session.commit()
-            out_id = day.id
+        return await self.get_day(day_id)
 
-        return await self.get_day(out_id)
+    async def _rebuild_free_slots(
+        self,
+        session: AsyncSession,
+        day: WorkingDay,
+        times: list[time],
+    ) -> None:
+        """Replace the free-slot grid for `day`.
 
-    async def get_day(self, day_id: int) -> WorkingDay:
-        async with self._sf() as session:
-            day = await session.scalar(
-                select(WorkingDay)
-                .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
-            )
-            if day is None:
-                raise DayNotFoundError("День не найден.")
-            return day
+        Two kinds of rows must survive, or the rebuild corrupts data:
 
-    async def list_upcoming_days(self, limit: int = 60) -> list[WorkingDay]:
-        await self.purge_past_days()
-        await self.release_expired_holds()
-        async with self._sf() as session:
-            result = await session.scalars(
-                select(WorkingDay)
-                .where(WorkingDay.day >= today())
-                .options(selectinload(WorkingDay.slots))
-                .order_by(WorkingDay.day)
-                .limit(limit)
-            )
-            return list(result)
+        * slots carrying a live booking (BOOKED / HELD);
+        * slots referenced by *any* booking row, including cancelled ones —
+          the FK is RESTRICT, so deleting them raises IntegrityError;
+        * slots the master closed by hand (BLOCKED) — re-inserting the same
+          start_time would violate `uq_slot_day_time`.
+        """
+        wanted = set(times)
+        keep_times: set[time] = set()
 
-    async def list_days_with_free_slots(self) -> list[tuple[WorkingDay, int]]:
-        await self.purge_past_days()
-        await self.release_expired_holds()
-        async with self._sf() as session:
-            days = list(
+        slot_ids = [s.id for s in day.slots if s.id is not None]
+        referenced: set[int] = set()
+        if slot_ids:
+            referenced = set(
                 await session.scalars(
-                    select(WorkingDay)
-                    .where(WorkingDay.day >= today())
-                    .options(selectinload(WorkingDay.slots))
-                    .order_by(WorkingDay.day)
+                    select(Booking.slot_id).where(Booking.slot_id.in_(slot_ids))
                 )
             )
-            out: list[tuple[WorkingDay, int]] = []
-            now = _utcnow()
-            for day in days:
-                free = sum(
-                    1
-                    for s in day.slots
-                    if self._is_bookable_slot(s, day.day, now)
-                )
-                if free:
-                    out.append((day, free))
-            return out
 
-    async def free_slots_for_day(self, day_id: int) -> list[Slot]:
-        await self.release_expired_holds()
-        async with self._sf() as session:
-            day = await session.scalar(
-                select(WorkingDay)
-                .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
-            )
-            if day is None:
-                raise DayNotFoundError("День не найден.")
-            if day.day < today():
-                return []
-            now = _utcnow()
-            return [
-                s for s in day.slots if self._is_bookable_slot(s, day.day, now)
-            ]
+        for slot in list(day.slots):
+            if slot.status in BUSY_SLOT_STATUSES:
+                keep_times.add(slot.start_time)
+                continue
+            if slot.status == SlotStatus.BLOCKED.value:
+                keep_times.add(slot.start_time)
+                continue
+            if slot.id in referenced:
+                # Historical booking pins this row. Keep it, but take it out of
+                # the offer if it is no longer part of the working grid.
+                keep_times.add(slot.start_time)
+                if slot.start_time not in wanted:
+                    slot.status = SlotStatus.BLOCKED.value
+                continue
+            await session.delete(slot)
 
-    async def purge_past_days(self, *, force: bool = False) -> int:
-        """Drop days before today. Keeps bot calendar in sync with the wall clock."""
-        now_mono = monotonic()
-        if (
-            not force
-            and now_mono - self._last_past_purge < _PAST_PURGE_MIN_INTERVAL
-        ):
-            return 0
-        self._last_past_purge = now_mono
-
-        cutoff = today()
-        async with self._sf() as session:
-            days = list(
-                await session.scalars(
-                    select(WorkingDay)
-                    .where(WorkingDay.day < cutoff)
-                    .options(
-                        selectinload(WorkingDay.slots).selectinload(Slot.bookings)
-                    )
+        await session.flush()
+        for start in times:
+            if start in keep_times:
+                continue
+            session.add(
+                Slot(
+                    working_day_id=day.id,
+                    start_time=start,
+                    status=SlotStatus.FREE.value,
                 )
             )
-            if not days:
-                return 0
-
-            live = {
-                BookingStatus.PENDING_PAYMENT.value,
-                BookingStatus.ACTIVE.value,
-            }
-            removed = 0
-            for day in days:
-                has_live = any(
-                    b.status in live
-                    for s in day.slots
-                    for b in s.bookings
-                )
-                if has_live:
-                    # Past active booking is a data anomaly — leave for manual review.
-                    continue
-                for slot in day.slots:
-                    for booking in list(slot.bookings):
-                        await session.delete(booking)
-                await session.delete(day)
-                removed += 1
-            if removed:
-                await session.commit()
-            return removed
 
     async def delete_day(self, day_id: int) -> None:
         async with self._sf() as session:
             day = await session.scalar(
                 select(WorkingDay)
                 .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
+                .options(selectinload(WorkingDay.slots).selectinload(Slot.bookings))
             )
             if day is None:
                 raise DayNotFoundError("День не найден.")
-            # BOOKED or HELD: slots are FK-restricted by live bookings — refuse cleanly
-            busy = {
-                SlotStatus.BOOKED.value,
-                SlotStatus.HELD.value,
-            }
-            if any(s.status in busy for s in day.slots):
+            if any(s.status in BUSY_SLOT_STATUSES for s in day.slots):
                 raise ValidationError(
                     "Нельзя удалить день с записями или бронью. Сначала отмени их."
                 )
+            # Historical bookings hold an FK on the slots; drop them explicitly,
+            # otherwise the ORM tries to NULL a NOT NULL column.
+            for slot in day.slots:
+                for booking in list(slot.bookings):
+                    await session.delete(booking)
+            await session.flush()
             await session.delete(day)
             await session.commit()
 
-    async def release_expired_holds(self, *, force: bool = False) -> int:
-        now_mono = monotonic()
-        if (
-            not force
-            and now_mono - self._last_hold_cleanup < _HOLD_CLEANUP_MIN_INTERVAL
-        ):
-            return 0
-        self._last_hold_cleanup = now_mono
-
-        now = _utcnow()
+    async def get_day(self, day_id: int) -> WorkingDay:
         async with self._sf() as session:
-            slots = list(
-                await session.scalars(
-                    select(Slot).where(Slot.status == SlotStatus.HELD.value)
-                )
-            )
-            if not slots:
-                return 0
-
-            expired_ids = [
-                slot.id
-                for slot in slots
-                if (held := _aware(slot.held_until)) is None or held < now
-            ]
-            if not expired_ids:
-                return 0
-
-            pending = list(
-                await session.scalars(
-                    select(Booking).where(
-                        Booking.slot_id.in_(expired_ids),
-                        Booking.status == BookingStatus.PENDING_PAYMENT.value,
-                    )
-                )
-            )
-            for booking in pending:
-                booking.status = BookingStatus.CANCELLED.value
-
-            by_id = {s.id: s for s in slots}
-            for slot_id in expired_ids:
-                slot = by_id[slot_id]
-                slot.status = SlotStatus.FREE.value
-                slot.held_by_user_id = None
-                slot.held_until = None
-
-            await session.commit()
-            return len(expired_ids)
+            return await self._load_day(session, day_id)
 
     @staticmethod
-    def _is_effectively_free(slot: Slot, now: datetime) -> bool:
-        if slot.status == SlotStatus.FREE.value:
-            return True
-        if slot.status == SlotStatus.HELD.value:
-            held_until = _aware(slot.held_until)
-            return held_until is not None and held_until < now
-        return False
+    async def _load_day(session: AsyncSession, day_id: int) -> WorkingDay:
+        day = await session.scalar(
+            select(WorkingDay)
+            .where(WorkingDay.id == day_id)
+            .options(selectinload(WorkingDay.slots))
+        )
+        if day is None:
+            raise DayNotFoundError("День не найден.")
+        return day
 
-    @classmethod
-    def _is_bookable_slot(cls, slot: Slot, day: date, now: datetime) -> bool:
-        """Free (or expired hold) and not in the past by bot clock."""
-        if not cls._is_effectively_free(slot, now):
-            return False
-        start = combine_datetime(day, slot.start_time)
-        return start > now
+    async def list_upcoming_days(self, limit: int = MAX_CALENDAR_DAYS) -> list[WorkingDay]:
+        async with self._sf() as session:
+            rows = await session.scalars(
+                select(WorkingDay)
+                .where(WorkingDay.day >= today())
+                .options(selectinload(WorkingDay.slots))
+                .order_by(WorkingDay.day)
+                .limit(limit)
+            )
+            return list(rows)
+
+    async def list_days_with_free_slots(self) -> list[tuple[WorkingDay, int]]:
+        days = await self.list_upcoming_days()
+        now = now_local()
+        out: list[tuple[WorkingDay, int]] = []
+        for day in days:
+            free = sum(
+                1 for s in day.slots if self.is_bookable_slot(s, day.day, now)
+            )
+            if free:
+                out.append((day, free))
+        return out
+
+    async def free_slots_for_day(self, day_id: int) -> list[Slot]:
+        async with self._sf() as session:
+            day = await self._load_day(session, day_id)
+            if day.day < today():
+                return []
+            now = now_local()
+            return sorted(
+                (s for s in day.slots if self.is_bookable_slot(s, day.day, now)),
+                key=lambda s: s.start_time,
+            )
 
     async def toggle_slot_block(self, slot_id: int) -> Slot:
         """Free <-> blocked. Cannot toggle booked/held."""
@@ -539,26 +360,115 @@ class ScheduleService:
             elif slot.status == SlotStatus.BLOCKED.value:
                 slot.status = SlotStatus.FREE.value
             else:
-                raise ValidationError("Этот слот занят записью — сначала отмени запись.")
+                raise ValidationError(
+                    "Этот слот занят записью — сначала отмени запись."
+                )
             await session.commit()
             await session.refresh(slot)
             return slot
 
-    async def set_prepayment_amount(self, amount: str) -> WorkSettings:
-        normalized = _normalize_prepayment_amount(amount)
-        async with self._sf() as session:
-            row = await session.get(WorkSettings, 1)
-            if row is None:
-                raise ValidationError("Настройки не найдены.")
-            row.prepayment_amount = normalized
-            await session.commit()
-            await session.refresh(row)
-            return row
+    # --- availability predicates ---------------------------------------
 
-# --- Booking ---
+    @staticmethod
+    def is_effectively_free(slot: Slot, now: datetime) -> bool:
+        """FREE, or a hold that has already lapsed."""
+        if slot.status == SlotStatus.FREE.value:
+            return True
+        if slot.status == SlotStatus.HELD.value:
+            held_until = to_local(slot.held_until)
+            return held_until is not None and held_until < now
+        return False
+
+    @classmethod
+    def is_bookable_slot(cls, slot: Slot, day: date, now: datetime) -> bool:
+        """Free (or expired hold) and not in the past by the bot clock."""
+        if not cls.is_effectively_free(slot, now):
+            return False
+        return combine_datetime(day, slot.start_time) > now
+
+    # --- housekeeping (scheduler owns the cadence) ----------------------
+
+    async def release_expired_holds(self) -> int:
+        """Free lapsed holds and cancel the pending bookings behind them."""
+        now = now_local()
+        async with self._sf() as session:
+            slots = list(
+                await session.scalars(
+                    select(Slot).where(Slot.status == SlotStatus.HELD.value)
+                )
+            )
+            expired = [
+                slot
+                for slot in slots
+                if (held := to_local(slot.held_until)) is None or held < now
+            ]
+            if not expired:
+                return 0
+
+            expired_ids = [slot.id for slot in expired]
+            pending = list(
+                await session.scalars(
+                    select(Booking).where(
+                        Booking.slot_id.in_(expired_ids),
+                        Booking.status == BookingStatus.PENDING_PAYMENT.value,
+                    )
+                )
+            )
+            for booking in pending:
+                booking.status = BookingStatus.CANCELLED.value
+
+            for slot in expired:
+                slot.status = SlotStatus.FREE.value
+                slot.held_by_user_id = None
+                slot.held_until = None
+
+            await session.commit()
+            return len(expired_ids)
+
+    async def purge_past_days(self) -> int:
+        """Drop past days that carry no history at all.
+
+        Days with bookings are kept: the booking rows are the salon's only
+        record of who came and what was paid, and they cannot outlive their
+        slot (FK RESTRICT + `Booking.slot` is required for rendering).
+        """
+        cutoff = today()
+        async with self._sf() as session:
+            days = list(
+                await session.scalars(
+                    select(WorkingDay)
+                    .where(WorkingDay.day < cutoff)
+                    .options(
+                        selectinload(WorkingDay.slots).selectinload(Slot.bookings)
+                    )
+                )
+            )
+            removed = 0
+            for day in days:
+                if any(slot.bookings for slot in day.slots):
+                    continue
+                await session.delete(day)
+                removed += 1
+            if removed:
+                await session.commit()
+            return removed
+
+
+def _snapshot(row: WorkSettings) -> WorkHours:
+    return WorkHours(
+        open_time=row.open_time,
+        close_time=row.close_time,
+        slot_minutes=row.slot_minutes or DEFAULT_SLOT_MINUTES,
+        prepayment_amount=row.prepayment_amount or "1 000 ₽",
+    )
+
+
+# --- Booking ---------------------------------------------------------------
 
 
 class BookingService:
+    """Client bookings: hold → receipt → active, plus admin operations."""
+
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
@@ -566,47 +476,149 @@ class BookingService:
     ) -> None:
         self._sf = session_factory
         self._settings = settings
-        self._last_settle = 0.0
+        self._schedule = ScheduleService(session_factory, settings)
+
+    # --- helpers -------------------------------------------------------
+
+    async def _step_for_day(self, session: AsyncSession, day: WorkingDay) -> int:
+        if day.slot_minutes:
+            return day.slot_minutes
+        cached = self._schedule.cached_work_hours()
+        if cached is not None:
+            return cached.slot_minutes
+        # Read on the caller's session: opening another one mid-transaction is
+        # how you get "database is locked" on SQLite.
+        row = await session.get(WorkSettings, 1)
+        return (row.slot_minutes if row else None) or DEFAULT_SLOT_MINUTES
 
     @staticmethod
-    def _slots_needed(duration_minutes: int, step: int) -> int:
-        return max(1, ceil(duration_minutes / step))
+    def _visit_start(booking: Booking) -> datetime:
+        return combine_datetime(
+            booking.slot.working_day.day, booking.slot.start_time
+        )
+
+    def _visit_end(self, booking: Booking, step: int) -> datetime:
+        duration = booking.duration_minutes or step
+        return self._visit_start(booking) + timedelta(minutes=duration)
+
+    async def _block_slots(
+        self, session: AsyncSession, booking: Booking
+    ) -> list[Slot]:
+        """Consecutive slots occupied by this booking, starting at booking.slot."""
+        day = booking.slot.working_day
+        if not day.slots:
+            await session.refresh(day, attribute_names=["slots"])
+        step = await self._step_for_day(session, day)
+        need = slots_needed(booking.duration_minutes or step, step)
+        ordered = sorted(day.slots, key=lambda s: s.start_time)
+        index = next(
+            (i for i, s in enumerate(ordered) if s.id == booking.slot_id), None
+        )
+        if index is None:
+            # Slot was moved out of this day — nothing sane to unblock.
+            return []
+        return ordered[index : index + need]
+
+    async def _apply_block_status(
+        self,
+        session: AsyncSession,
+        booking: Booking,
+        status: str,
+        *,
+        clear_hold: bool,
+    ) -> None:
+        if booking.slot is None or booking.slot.working_day is None:
+            reloaded = await session.scalar(
+                select(Booking)
+                .where(Booking.id == booking.id)
+                .options(
+                    selectinload(Booking.slot)
+                    .selectinload(Slot.working_day)
+                    .selectinload(WorkingDay.slots)
+                )
+            )
+            if reloaded is None:
+                raise BookingNotFoundError("Запись не найдена.")
+            booking = reloaded
+        elif not booking.slot.working_day.slots:
+            await session.refresh(booking.slot.working_day, attribute_names=["slots"])
+
+        for slot in await self._block_slots(session, booking):
+            slot.status = status
+            if clear_hold:
+                slot.held_by_user_id = None
+                slot.held_until = None
+            else:
+                slot.held_by_user_id = booking.telegram_user_id
+
+    async def _free_block(self, session: AsyncSession, booking: Booking) -> None:
+        await self._apply_block_status(
+            session, booking, SlotStatus.FREE.value, clear_hold=True
+        )
+
+    async def _settle_user_past(
+        self, session: AsyncSession, user_id: int, now: datetime
+    ) -> None:
+        """Close out one client's finished/expired bookings.
+
+        Needed before every availability check: `uq_live_booking_user` counts
+        live rows regardless of date, so a stale row would wrongly block the
+        client from booking again.
+        """
+        bookings = list(
+            await session.scalars(
+                select(Booking)
+                .where(
+                    Booking.telegram_user_id == user_id,
+                    Booking.status.in_(LIVE_BOOKING_STATUSES),
+                )
+                .options(
+                    selectinload(Booking.slot)
+                    .selectinload(Slot.working_day)
+                    .selectinload(WorkingDay.slots)
+                )
+            )
+        )
+        changed = False
+        for booking in bookings:
+            step = await self._step_for_day(session, booking.slot.working_day)
+            if self._visit_end(booking, step) > now:
+                continue
+            booking.status = (
+                BookingStatus.COMPLETED.value
+                if booking.status == BookingStatus.ACTIVE.value
+                else BookingStatus.CANCELLED.value
+            )
+            await self._apply_block_status(
+                session, booking, SlotStatus.FREE.value, clear_hold=True
+            )
+            changed = True
+        if changed:
+            await session.flush()
+
+    @staticmethod
+    async def _count_live(session: AsyncSession, user_id: int) -> int:
+        return int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Booking)
+                .where(
+                    Booking.telegram_user_id == user_id,
+                    Booking.status.in_(LIVE_BOOKING_STATUSES),
+                )
+            )
+            or 0
+        )
+
+    # --- client flow ---------------------------------------------------
 
     async def user_has_active_booking(self, user_id: int) -> bool:
-        await self.settle_past_bookings()
+        now = now_local()
         async with self._sf() as session:
-            q = select(func.count()).select_from(Booking).where(
-                Booking.telegram_user_id == user_id,
-                Booking.status.in_(
-                    [
-                        BookingStatus.PENDING_PAYMENT.value,
-                        BookingStatus.ACTIVE.value,
-                    ]
-                ),
-            )
-            return bool(await session.scalar(q))
-
-    async def free_starts_for_service(self, day_id: int, service: Service) -> list[Slot]:
-        await ScheduleService(self._sf, self._settings).release_expired_holds()
-        async with self._sf() as session:
-            day = await session.scalar(
-                select(WorkingDay)
-                .where(WorkingDay.id == day_id)
-                .options(selectinload(WorkingDay.slots))
-            )
-            if day is None:
-                raise DayNotFoundError("День не найден.")
-            ws = await session.get(WorkSettings, 1)
-            step = day.slot_minutes or (ws.slot_minutes if ws else 60)
-            need = self._slots_needed(service.duration_minutes, step)
-            now = _utcnow()
-            slots = sorted(day.slots, key=lambda s: s.start_time)
-            starts: list[Slot] = []
-            for i in range(len(slots) - need + 1):
-                block = slots[i : i + need]
-                if all(ScheduleService._is_effectively_free(s, now) for s in block):
-                    starts.append(block[0])
-            return starts
+            await self._settle_user_past(session, user_id, now)
+            has_live = await self._count_live(session, user_id) > 0
+            await session.commit()
+            return has_live
 
     async def hold_slot(
         self,
@@ -616,15 +628,19 @@ class BookingService:
         username: str | None,
         full_name: str,
         phone: str,
-        service: Service | None = None,
+        duration_minutes: int | None = None,
     ) -> Booking:
-        if await self.user_has_active_booking(user_id):
-            raise AlreadyHasBookingError(
-                "У тебя уже есть активная запись. Сначала отмени её или дождись визита."
-            )
+        now = now_local()
+        hold_until = now + timedelta(minutes=self._settings.slot_hold_minutes)
 
-        hold_until = _utcnow() + timedelta(minutes=self._settings.slot_hold_minutes)
         async with self._sf() as session:
+            await self._settle_user_past(session, user_id, now)
+            if await self._count_live(session, user_id):
+                raise AlreadyHasBookingError(
+                    "У тебя уже есть активная запись. "
+                    "Сначала отмени её или дождись визита."
+                )
+
             slot = await session.scalar(
                 select(Slot)
                 .where(Slot.id == slot_id)
@@ -636,55 +652,53 @@ class BookingService:
 
             day = slot.working_day
             if day.day < today():
-                raise SlotNotAvailableError(
-                    "Этот день уже прошёл. Выбери другую дату."
-                )
-            ws = await session.get(WorkSettings, 1)
-            step = day.slot_minutes or (ws.slot_minutes if ws else 60)
-            duration = service.duration_minutes if service else step
-            need = self._slots_needed(duration, step)
-            now = _utcnow()
-            ordered = sorted(day.slots, key=lambda s: s.start_time)
-            try:
-                idx = next(i for i, s in enumerate(ordered) if s.id == slot.id)
-            except StopIteration as exc:
-                raise SlotNotFoundError("Слот не найден.") from exc
-            block = ordered[idx : idx + need]
+                raise SlotNotAvailableError("Этот день уже прошёл. Выбери другую дату.")
+
+            step = await self._step_for_day(session, day)
+            duration = duration_minutes or step
+            need = slots_needed(duration, step)
+            block = _consecutive_block(day.slots, slot.id, need)
             if len(block) < need or not all(
-                ScheduleService._is_bookable_slot(s, day.day, now) for s in block
+                ScheduleService.is_bookable_slot(s, day.day, now) for s in block
             ):
                 raise SlotNotAvailableError(
                     "Это время уже недоступно. Выбери другое окошко."
                 )
 
-            for s in block:
-                stale = await session.scalar(
+            stale = list(
+                await session.scalars(
                     select(Booking).where(
-                        Booking.slot_id == s.id,
+                        Booking.slot_id.in_([s.id for s in block]),
                         Booking.status == BookingStatus.PENDING_PAYMENT.value,
                     )
                 )
-                if stale:
-                    stale.status = BookingStatus.CANCELLED.value
-                s.status = SlotStatus.HELD.value
-                s.held_by_user_id = user_id
-                s.held_until = hold_until
+            )
+            for booking in stale:
+                booking.status = BookingStatus.CANCELLED.value
+
+            for slot_in_block in block:
+                slot_in_block.status = SlotStatus.HELD.value
+                slot_in_block.held_by_user_id = user_id
+                slot_in_block.held_until = hold_until
 
             booking = Booking(
                 slot_id=block[0].id,
                 telegram_user_id=user_id,
                 username=username,
-                full_name=full_name.strip(),
-                phone=phone.strip(),
-                service_code=service.code.value if service else None,
-                service_title=service.title if service else None,
+                full_name=full_name,
+                phone=phone,
                 duration_minutes=duration,
                 status=BookingStatus.PENDING_PAYMENT.value,
             )
             session.add(booking)
-            await session.commit()
-            await session.refresh(booking)
-            return await self.get_booking(booking.id)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise _map_booking_conflict(exc) from exc
+            booking_id = booking.id
+
+        return await self.get_booking(booking_id)
 
     async def confirm_with_receipt(
         self,
@@ -694,6 +708,7 @@ class BookingService:
         receipt_file_id: str,
         receipt_file_type: str,
     ) -> Booking:
+        now = now_local()
         async with self._sf() as session:
             booking = await session.scalar(
                 select(Booking)
@@ -701,7 +716,7 @@ class BookingService:
                 .options(
                     selectinload(Booking.slot)
                     .selectinload(Slot.working_day)
-                    .selectinload(WorkingDay.slots),
+                    .selectinload(WorkingDay.slots)
                 )
                 .with_for_update()
             )
@@ -711,8 +726,7 @@ class BookingService:
                 raise ValidationError("Эта запись уже обработана.")
 
             slot = booking.slot
-            now = _utcnow()
-            held_until = _aware(slot.held_until)
+            held_until = to_local(slot.held_until)
             if (
                 slot.status != SlotStatus.HELD.value
                 or slot.held_by_user_id != user_id
@@ -726,62 +740,97 @@ class BookingService:
                     "Время ожидания оплаты истекло. Начни запись заново."
                 )
 
-            booking.status = BookingStatus.ACTIVE.value
-            booking.receipt_file_id = receipt_file_id
-            booking.receipt_file_type = receipt_file_type
-            booking.confirmed_at = now
+            # Conditional UPDATE: two receipts sent back to back must not both
+            # win (SQLite gives us no row lock to lean on).
+            result = await session.execute(
+                update(Booking)
+                .where(
+                    Booking.id == booking_id,
+                    Booking.status == BookingStatus.PENDING_PAYMENT.value,
+                )
+                .values(
+                    status=BookingStatus.ACTIVE.value,
+                    receipt_file_id=receipt_file_id,
+                    receipt_file_type=receipt_file_type,
+                    confirmed_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if not result.rowcount:
+                await session.rollback()
+                raise ValidationError("Эта запись уже обработана.")
+
+            # `booking` is intentionally left untouched by the ORM: it is not
+            # dirty, so the stale in-memory status is never flushed back.
             await self._apply_block_status(
                 session, booking, SlotStatus.BOOKED.value, clear_hold=True
             )
             await session.commit()
-            await session.refresh(booking)
-            return await self.get_booking(booking.id)
 
-    async def _block_slots(self, session: AsyncSession, booking: Booking) -> list[Slot]:
-        day = booking.slot.working_day
-        if day.slots is None or not day.slots:
-            await session.refresh(day, attribute_names=["slots"])
-        ws = await session.get(WorkSettings, 1)
-        step = day.slot_minutes or (ws.slot_minutes if ws else 60)
-        duration = booking.duration_minutes or step
-        need = self._slots_needed(duration, step)
-        ordered = sorted(day.slots, key=lambda s: s.start_time)
-        idx = next(i for i, s in enumerate(ordered) if s.id == booking.slot_id)
-        return ordered[idx : idx + need]
+        return await self.get_booking(booking_id)
 
-    async def _apply_block_status(
-        self,
-        session: AsyncSession,
-        booking: Booking,
-        status: str,
-        *,
-        clear_hold: bool,
-    ) -> None:
-        # ensure relationships loaded
-        if booking.slot is None or booking.slot.working_day is None:
-            booking = await session.scalar(
-                select(Booking)
-                .where(Booking.id == booking.id)
-                .options(selectinload(Booking.slot).selectinload(Slot.working_day).selectinload(WorkingDay.slots))
+    async def find_receipt_target(self, user_id: int) -> Booking | None:
+        """The booking an unexpected photo from this user is a receipt for.
+
+        FSM state lives in process memory, so a redeploy in the minute between
+        «Оплатить» and sending the receipt used to leave the client with a
+        useless «не поняла» — money paid, no booking. The pending row in the
+        database is the durable record, so it is what we look at.
+        """
+        async with self._sf() as session:
+            pending = await session.scalar(
+                self._booking_query()
+                .where(
+                    Booking.telegram_user_id == user_id,
+                    Booking.status == BookingStatus.PENDING_PAYMENT.value,
+                )
+                .order_by(Booking.id.desc())
+                .limit(1)
             )
-            assert booking is not None
-        elif not booking.slot.working_day.slots:
-            await session.refresh(booking.slot.working_day, attribute_names=["slots"])
+            if pending is not None:
+                return pending
 
-        for s in await self._block_slots(session, booking):
-            s.status = status
-            if clear_hold:
-                s.held_by_user_id = None
-                s.held_until = None
-            else:
-                s.held_by_user_id = booking.telegram_user_id
+            # The hold lapsed while the bot was down, or the sweep cancelled it.
+            # The money is still real, so the master must see the receipt.
+            cutoff = now_local() - LATE_RECEIPT_GRACE
+            return await session.scalar(
+                self._booking_query()
+                .where(
+                    Booking.telegram_user_id == user_id,
+                    Booking.status == BookingStatus.CANCELLED.value,
+                    Booking.receipt_file_id.is_(None),
+                    Booking.created_at >= cutoff,
+                )
+                .order_by(Booking.id.desc())
+                .limit(1)
+            )
 
-    async def _free_block(self, session: AsyncSession, booking: Booking) -> None:
-        await self._apply_block_status(
-            session, booking, SlotStatus.FREE.value, clear_hold=True
-        )
+    async def attach_late_receipt(
+        self,
+        booking_id: int,
+        *,
+        receipt_file_id: str,
+        receipt_file_type: str,
+    ) -> Booking:
+        """Record a receipt that arrived after the hold expired.
 
-    async def cancel_booking(self, booking_id: int, *, by_admin: bool = False) -> Booking:
+        The status stays CANCELLED on purpose: the slot may already belong to
+        somebody else, and only the master can decide what to do about it.
+        """
+        async with self._sf() as session:
+            booking = await session.get(Booking, booking_id)
+            if booking is None:
+                raise BookingNotFoundError("Запись не найдена.")
+            if booking.receipt_file_id:
+                raise ValidationError("Чек по этой записи уже получен.")
+            booking.receipt_file_id = receipt_file_id
+            booking.receipt_file_type = receipt_file_type
+            if not booking.note:
+                booking.note = "Оплата пришла после истечения брони"
+            await session.commit()
+        return await self.get_booking(booking_id)
+
+    async def cancel_booking(self, booking_id: int) -> Booking:
         async with self._sf() as session:
             booking = await session.scalar(
                 select(Booking)
@@ -800,180 +849,25 @@ class BookingService:
             booking.status = BookingStatus.CANCELLED.value
             await self._free_block(session, booking)
             await session.commit()
-            await session.refresh(booking)
-            return booking
+        return await self.get_booking(booking_id)
 
     async def cancel_by_client(self, booking_id: int, user_id: int) -> Booking:
         booking = await self.get_booking(booking_id)
         if booking.telegram_user_id != user_id:
             raise PermissionDeniedError("Это не твоя запись.")
-        if booking.status not in {
-            BookingStatus.ACTIVE.value,
-            BookingStatus.PENDING_PAYMENT.value,
-        }:
+        if booking.status not in LIVE_BOOKING_STATUSES:
             raise ValidationError("Эту запись уже нельзя отменить.")
-        visit = combine_datetime(booking.slot.working_day.day, booking.slot.start_time)
-        if booking.status == BookingStatus.ACTIVE.value and visit - _utcnow() < timedelta(hours=24):
+        if (
+            booking.status == BookingStatus.ACTIVE.value
+            and self._visit_start(booking) - now_local() < CLIENT_CANCEL_CUTOFF
+        ):
             raise ValidationError(
                 "Отмена меньше чем за 24 часа до визита — напиши мастеру 🤍"
             )
         return await self.cancel_booking(booking_id)
 
-    async def list_user_bookings(self, user_id: int) -> list[Booking]:
-        async with self._sf() as session:
-            result = await session.scalars(
-                select(Booking)
-                .join(Slot)
-                .join(WorkingDay)
-                .where(
-                    Booking.telegram_user_id == user_id,
-                    Booking.status.in_(
-                        [BookingStatus.ACTIVE.value, BookingStatus.PENDING_PAYMENT.value]
-                    ),
-                    WorkingDay.day >= today(),
-                )
-                .options(selectinload(Booking.slot).selectinload(Slot.working_day))
-                .order_by(WorkingDay.day, Slot.start_time)
-            )
-            return list(result)
-
-    async def list_booking_days(self) -> list[tuple[int, date, int]]:
-        """(working_day_id, date, bookings_count) for upcoming days with bookings."""
-        items = await self.list_upcoming()
-        counts: dict[int, tuple[date, int]] = {}
-        for b in items:
-            day = b.slot.working_day
-            prev = counts.get(day.id)
-            counts[day.id] = (day.day, (prev[1] if prev else 0) + 1)
-        return sorted(
-            [(did, d, c) for did, (d, c) in counts.items()],
-            key=lambda x: x[1],
-        )
-
-    async def list_for_working_day(self, working_day_id: int) -> list[Booking]:
-        async with self._sf() as session:
-            result = await session.scalars(
-                select(Booking)
-                .join(Slot)
-                .where(
-                    Slot.working_day_id == working_day_id,
-                    Booking.status.in_(
-                        [BookingStatus.ACTIVE.value, BookingStatus.PENDING_PAYMENT.value]
-                    ),
-                )
-                .options(selectinload(Booking.slot).selectinload(Slot.working_day))
-                .order_by(Slot.start_time)
-            )
-            return list(result)
-
-    async def list_for_date(self, day: date) -> list[Booking]:
-        async with self._sf() as session:
-            result = await session.scalars(
-                select(Booking)
-                .join(Slot)
-                .join(WorkingDay)
-                .where(
-                    WorkingDay.day == day,
-                    Booking.status.in_(
-                        [BookingStatus.ACTIVE.value, BookingStatus.PENDING_PAYMENT.value]
-                    ),
-                )
-                .options(selectinload(Booking.slot).selectinload(Slot.working_day))
-                .order_by(Slot.start_time)
-            )
-            return list(result)
-
-    async def due_reminders(self) -> tuple[list[Booking], list[Booking]]:
-        """Return (need_24h, need_2h) active bookings."""
-        now = _utcnow()
-        async with self._sf() as session:
-            items = list(
-                await session.scalars(
-                    select(Booking)
-                    .join(Slot)
-                    .join(WorkingDay)
-                    .where(
-                        Booking.status == BookingStatus.ACTIVE.value,
-                        WorkingDay.day >= today(),
-                    )
-                    .options(selectinload(Booking.slot).selectinload(Slot.working_day))
-                )
-            )
-        need_24: list[Booking] = []
-        need_2: list[Booking] = []
-        for b in items:
-            visit = combine_datetime(b.slot.working_day.day, b.slot.start_time)
-            delta = visit - now
-            if not b.reminded_24h and timedelta(hours=23) <= delta <= timedelta(hours=25):
-                need_24.append(b)
-            if not b.reminded_2h and timedelta(hours=1, minutes=45) <= delta <= timedelta(hours=2, minutes=15):
-                need_2.append(b)
-        return need_24, need_2
-
-    async def mark_reminded(self, booking_id: int, *, kind: str) -> None:
-        async with self._sf() as session:
-            booking = await session.get(Booking, booking_id)
-            if booking is None:
-                return
-            if kind == "24h":
-                booking.reminded_24h = True
-            elif kind == "2h":
-                booking.reminded_2h = True
-            await session.commit()
-
-    async def settle_past_bookings(self, *, force: bool = False) -> int:
-        """Mark past visits completed / expire stale pending — unblock clients."""
-        now_mono = monotonic()
-        if (
-            not force
-            and now_mono - self._last_settle < _PAST_PURGE_MIN_INTERVAL
-        ):
-            return 0
-        self._last_settle = now_mono
-
-        now = _utcnow()
-        async with self._sf() as session:
-            bookings = list(
-                await session.scalars(
-                    select(Booking)
-                    .where(
-                        Booking.status.in_(
-                            [
-                                BookingStatus.PENDING_PAYMENT.value,
-                                BookingStatus.ACTIVE.value,
-                            ]
-                        )
-                    )
-                    .options(
-                        selectinload(Booking.slot)
-                        .selectinload(Slot.working_day)
-                        .selectinload(WorkingDay.slots)
-                    )
-                )
-            )
-            settled = 0
-            for booking in bookings:
-                start = combine_datetime(
-                    booking.slot.working_day.day, booking.slot.start_time
-                )
-                if start > now:
-                    continue
-                if booking.status == BookingStatus.ACTIVE.value:
-                    booking.status = BookingStatus.COMPLETED.value
-                else:
-                    booking.status = BookingStatus.CANCELLED.value
-                await self._apply_block_status(
-                    session,
-                    booking,
-                    SlotStatus.FREE.value,
-                    clear_hold=True,
-                )
-                settled += 1
-            if settled:
-                await session.commit()
-            return settled
-
     async def reschedule(self, booking_id: int, new_slot_id: int) -> Booking:
+        now = now_local()
         async with self._sf() as session:
             booking = await session.scalar(
                 select(Booking)
@@ -987,10 +881,7 @@ class BookingService:
             )
             if booking is None:
                 raise BookingNotFoundError("Запись не найдена.")
-            if booking.status not in {
-                BookingStatus.ACTIVE.value,
-                BookingStatus.PENDING_PAYMENT.value,
-            }:
+            if booking.status not in LIVE_BOOKING_STATUSES:
                 raise ValidationError("Эту запись нельзя перенести.")
 
             new_slot = await session.scalar(
@@ -1002,258 +893,217 @@ class BookingService:
             if new_slot is None:
                 raise SlotNotFoundError("Новый слот не найден.")
 
-            now = _utcnow()
-            ws = await session.get(WorkSettings, 1)
             new_day = new_slot.working_day
-            step = new_day.slot_minutes or (ws.slot_minutes if ws else 60)
-            duration = booking.duration_minutes or step
-            need = self._slots_needed(duration, step)
-            ordered = sorted(new_day.slots, key=lambda s: s.start_time)
-            try:
-                idx = next(i for i, s in enumerate(ordered) if s.id == new_slot.id)
-            except StopIteration as exc:
-                raise SlotNotFoundError("Новый слот не найден.") from exc
-            new_block = ordered[idx : idx + need]
+            step = await self._step_for_day(session, new_day)
+            need = slots_needed(booking.duration_minutes or step, step)
+            new_block = _consecutive_block(new_day.slots, new_slot.id, need)
+            if not new_block:
+                raise SlotNotFoundError("Новый слот не найден.")
 
-            def _slot_free(s: Slot) -> bool:
-                if s.status == SlotStatus.FREE.value:
-                    return True
-                if s.status == SlotStatus.HELD.value:
-                    until = _aware(s.held_until)
-                    return until is not None and until < now
-                return False
-
-            # Allow moving within the same booking's current block
             old_block_ids = {s.id for s in await self._block_slots(session, booking)}
             if len(new_block) < need or not all(
-                _slot_free(s) or s.id in old_block_ids for s in new_block
+                ScheduleService.is_effectively_free(s, now) or s.id in old_block_ids
+                for s in new_block
             ):
                 raise SlotNotAvailableError("Новое время уже занято.")
 
             await self._free_block(session, booking)
             booking.slot_id = new_block[0].id
-            # refresh relationship for _apply_block_status
             booking.slot = new_block[0]
+            # The visit moved: previously sent reminders no longer apply.
+            booking.reminded_24h = False
+            booking.reminded_2h = False
+
             if booking.status == BookingStatus.ACTIVE.value:
                 await self._apply_block_status(
                     session, booking, SlotStatus.BOOKED.value, clear_hold=True
                 )
             else:
-                hold_until = now + timedelta(minutes=self._settings.slot_hold_minutes)
-                for s in new_block:
-                    s.status = SlotStatus.HELD.value
-                    s.held_by_user_id = booking.telegram_user_id
-                    s.held_until = hold_until
+                hold_until = now + timedelta(
+                    minutes=self._settings.slot_hold_minutes
+                )
+                for slot_in_block in new_block:
+                    slot_in_block.status = SlotStatus.HELD.value
+                    slot_in_block.held_by_user_id = booking.telegram_user_id
+                    slot_in_block.held_until = hold_until
 
-            await session.commit()
-            return await self.get_booking(booking.id)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise _map_booking_conflict(exc) from exc
+
+        return await self.get_booking(booking_id)
+
+    # --- queries -------------------------------------------------------
 
     async def get_booking(self, booking_id: int) -> Booking:
         async with self._sf() as session:
             booking = await session.scalar(
-                select(Booking)
-                .where(Booking.id == booking_id)
-                .options(selectinload(Booking.slot).selectinload(Slot.working_day))
+                self._booking_query().where(Booking.id == booking_id)
             )
             if booking is None:
                 raise BookingNotFoundError("Запись не найдена.")
             return booking
 
-    async def list_upcoming(self, limit: int = 50) -> list[Booking]:
+    async def list_user_bookings(self, user_id: int) -> list[Booking]:
         async with self._sf() as session:
-            result = await session.scalars(
-                select(Booking)
-                .join(Slot)
-                .join(WorkingDay)
-                .where(
-                    Booking.status.in_(
-                        [
-                            BookingStatus.ACTIVE.value,
-                            BookingStatus.PENDING_PAYMENT.value,
-                        ]
-                    ),
+            rows = await session.scalars(
+                self._live_bookings_query().where(
+                    Booking.telegram_user_id == user_id,
                     WorkingDay.day >= today(),
                 )
-                .options(selectinload(Booking.slot).selectinload(Slot.working_day))
-                .order_by(WorkingDay.day, Slot.start_time)
-                .limit(limit)
             )
-            return list(result)
+            return list(rows)
 
+    async def list_for_working_day(self, working_day_id: int) -> list[Booking]:
+        async with self._sf() as session:
+            rows = await session.scalars(
+                self._live_bookings_query().where(
+                    Slot.working_day_id == working_day_id
+                )
+            )
+            return list(rows)
 
-def format_booking_status(status: str) -> str:
-    labels = {
-        BookingStatus.PENDING_PAYMENT.value: "ждёт оплату",
-        BookingStatus.ACTIVE.value: "подтверждена",
-        BookingStatus.CANCELLED.value: "отменена",
-        BookingStatus.COMPLETED.value: "завершена",
-        BookingStatus.NO_SHOW.value: "не пришла",
-    }
-    return labels.get(status, status)
+    async def list_booking_days(self) -> list[tuple[int, date, int]]:
+        """(working_day_id, date, count) for upcoming days that have bookings.
 
+        Aggregated in SQL: building this from a limited booking list used to
+        drop whole days once the salon had more than 50 upcoming bookings.
+        """
+        async with self._sf() as session:
+            rows = await session.execute(
+                select(WorkingDay.id, WorkingDay.day, func.count(Booking.id))
+                .join(Slot, Slot.working_day_id == WorkingDay.id)
+                .join(Booking, Booking.slot_id == Slot.id)
+                .where(
+                    WorkingDay.day >= today(),
+                    Booking.status.in_(LIVE_BOOKING_STATUSES),
+                )
+                .group_by(WorkingDay.id, WorkingDay.day)
+                .order_by(WorkingDay.day)
+            )
+            return [(day_id, day, count) for day_id, day, count in rows]
 
-def format_admin_booking_card(booking: Booking) -> str:
-    """Compact card for master: who / when / contact. No service leftovers."""
-    import html
-
-    day = booking.slot.working_day.day
-    t = booking.slot.start_time
-    uname = (
-        f"@{html.escape(booking.username)}"
-        if booking.username
-        else "нет username"
-    )
-    lines = [
-        f"<b>Запись #{booking.id}</b>",
-        f"📅 <b>{format_date_short(day)}</b> · {format_time(t)}",
-        "",
-        f"<b>{html.escape(booking.full_name)}</b>",
-        html.escape(booking.phone),
-        uname,
-    ]
-    if booking.status == BookingStatus.PENDING_PAYMENT.value:
-        lines.extend(["", "⏳ ждёт оплату"])
-    return "\n".join(lines)
-
-
-def format_client_booking_card(booking: Booking) -> str:
-    day = booking.slot.working_day.day
-    t = booking.slot.start_time
-    lines = [f"✨ <b>{format_date_short(day)} · {format_time(t)}</b>"]
-    if booking.status == BookingStatus.PENDING_PAYMENT.value:
-        lines.append("ждёт оплату")
-    return "\n".join(lines)
-
-
-def format_booking_card(booking: Booking) -> str:
-    """Admin-oriented card (kept for callers)."""
-    return format_admin_booking_card(booking)
-
-
-def parse_times_line(raw: str) -> list[time]:
-    """Parse '10:00, 11:30, 13:00' or multiline times."""
-    parts = [p.strip() for p in raw.replace(";", ",").replace("\n", ",").split(",")]
-    times: list[time] = []
-    for part in parts:
-        if not part:
-            continue
-        try:
-            hh, mm = part.split(":")
-            times.append(time(int(hh), int(mm)))
-        except ValueError as exc:
-            raise ValidationError(
-                f"Не поняла время «{part}». Формат: 10:00, 11:30, 13:00"
-            ) from exc
-    return times
-
-
-def parse_hours_message(raw: str) -> tuple[time, time, int]:
-    """
-    Parse open–close hours. Slot step is always DEFAULT_SLOT_MINUTES (hourly).
-    Formats: 10:00-22:00 | 10:00 22:00
-    Trailing numbers (legacy step) are ignored.
-    """
-    cleaned = raw.strip().lower().replace("–", "-").replace("—", "-")
-    parts = cleaned.replace(",", " ").split()
-    if not parts:
-        raise ValidationError("Формат: <code>10:00-22:00</code>")
-
-    if "-" in parts[0]:
-        left, right = parts[0].split("-", 1)
-        open_t = parse_times_line(left)[0]
-        close_t = parse_times_line(right)[0]
-    elif len(parts) >= 2:
-        open_t = parse_times_line(parts[0])[0]
-        close_t = parse_times_line(parts[1])[0]
-    else:
-        raise ValidationError("Формат: <code>10:00-22:00</code>")
-
-    step = DEFAULT_SLOT_MINUTES
-    generate_slot_times(open_t, close_t, step)
-    return open_t, close_t, step
-
-
-def format_hours(open_t: time, close_t: time, step: int | None = None) -> str:
-    return f"{format_time(open_t)}–{format_time(close_t)}"
-
-
-def _normalize_prepayment_amount(raw: str) -> str:
-    """Master types digits only; always store as «N ₽»."""
-    text = (raw or "").strip().lower()
-    for junk in ("₽", "руб.", "руб", "р.", "р"):
-        text = text.replace(junk, "")
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if not digits:
-        raise ValidationError("Напиши сумму числом — например 500")
-    value = int(digits)
-    if value < 1 or value > 1_000_000:
-        raise ValidationError("Сумма должна быть от 1 до 1 000 000")
-    pretty = f"{value:,}".replace(",", " ")
-    return f"{pretty} ₽"
-
-
-def parse_day(raw: str) -> date:
-    """Accept DD.MM, DD.MM.YYYY, YYYY-MM-DD.
-
-    DD.MM is stored as a real calendar date with year:
-    this year if still upcoming, otherwise next year (bot clock).
-    Explicit years in the past are rejected.
-    """
-    raw = raw.strip()
-    parsed: date | None = None
-    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
-        try:
-            parsed = datetime.strptime(raw, fmt).date()
-            break
-        except ValueError:
-            continue
-
-    if parsed is None:
-        try:
-            day_n, month_n = raw.split(".", 1)
-            d = int(day_n)
-            m = int(month_n)
-            now = today()
-            candidate = date(now.year, m, d)
-            if candidate < now:
-                candidate = date(now.year + 1, m, d)
-            parsed = candidate
-        except (ValueError, TypeError) as exc:
-            raise ValidationError(
-                "Дата в формате <code>01.10</code> или <code>01.10.2026</code>"
-            ) from exc
-
-    if parsed < today():
-        raise ValidationError(
-            f"Дата {parsed.day:02d}.{parsed.month:02d}.{parsed.year} уже прошла."
+    @staticmethod
+    def _booking_query():
+        """Booking with its slot and day loaded — enough to render any card."""
+        return select(Booking).options(
+            selectinload(Booking.slot).selectinload(Slot.working_day)
         )
-    return parsed
+
+    @staticmethod
+    def _live_bookings_query():
+        return (
+            select(Booking)
+            .join(Slot, Booking.slot_id == Slot.id)
+            .join(WorkingDay, Slot.working_day_id == WorkingDay.id)
+            .where(Booking.status.in_(LIVE_BOOKING_STATUSES))
+            .options(selectinload(Booking.slot).selectinload(Slot.working_day))
+            .order_by(WorkingDay.day, Slot.start_time)
+        )
+
+    # --- reminders / housekeeping --------------------------------------
+
+    async def due_reminders(self) -> tuple[list[Booking], list[Booking]]:
+        """Return (need_24h, need_2h) active bookings."""
+        now = now_local()
+        async with self._sf() as session:
+            items = list(
+                await session.scalars(
+                    select(Booking)
+                    .join(Slot, Booking.slot_id == Slot.id)
+                    .join(WorkingDay, Slot.working_day_id == WorkingDay.id)
+                    .where(
+                        Booking.status == BookingStatus.ACTIVE.value,
+                        WorkingDay.day >= today(),
+                    )
+                    .options(
+                        selectinload(Booking.slot).selectinload(Slot.working_day)
+                    )
+                )
+            )
+        need_24: list[Booking] = []
+        need_2: list[Booking] = []
+        for booking in items:
+            delta = self._visit_start(booking) - now
+            if not booking.reminded_24h and (
+                timedelta(hours=23) <= delta <= timedelta(hours=25)
+            ):
+                need_24.append(booking)
+            if not booking.reminded_2h and (
+                timedelta(hours=1, minutes=45) <= delta <= timedelta(hours=2, minutes=15)
+            ):
+                need_2.append(booking)
+        return need_24, need_2
+
+    async def mark_reminded(self, booking_id: int, *, kind: str) -> None:
+        column = {"24h": "reminded_24h", "2h": "reminded_2h"}.get(kind)
+        if column is None:
+            raise ValidationError(f"Unknown reminder kind: {kind}")
+        async with self._sf() as session:
+            await session.execute(
+                update(Booking)
+                .where(Booking.id == booking_id)
+                .values(**{column: True})
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+
+    async def settle_past_bookings(self) -> int:
+        """Mark finished visits completed and expire stale pending ones."""
+        now = now_local()
+        async with self._sf() as session:
+            bookings = list(
+                await session.scalars(
+                    select(Booking)
+                    .join(Slot, Booking.slot_id == Slot.id)
+                    .join(WorkingDay, Slot.working_day_id == WorkingDay.id)
+                    .where(
+                        Booking.status.in_(LIVE_BOOKING_STATUSES),
+                        WorkingDay.day <= today(),
+                    )
+                    .options(
+                        selectinload(Booking.slot)
+                        .selectinload(Slot.working_day)
+                        .selectinload(WorkingDay.slots)
+                    )
+                )
+            )
+            settled = 0
+            for booking in bookings:
+                step = await self._step_for_day(session, booking.slot.working_day)
+                if self._visit_end(booking, step) > now:
+                    continue
+                booking.status = (
+                    BookingStatus.COMPLETED.value
+                    if booking.status == BookingStatus.ACTIVE.value
+                    else BookingStatus.CANCELLED.value
+                )
+                await self._apply_block_status(
+                    session, booking, SlotStatus.FREE.value, clear_hold=True
+                )
+                settled += 1
+            if settled:
+                await session.commit()
+            return settled
 
 
-def parse_days_column(raw: str) -> tuple[list[date], list[str]]:
-    """
-    Parse one or many dates from a column / list.
-    Returns (valid_dates, bad_tokens).
-    """
-    import re
+def _consecutive_block(slots: list[Slot], start_slot_id: int, need: int) -> list[Slot]:
+    """`need` slots starting at `start_slot_id`, in time order. [] if not found."""
+    ordered = sorted(slots, key=lambda s: s.start_time)
+    index = next((i for i, s in enumerate(ordered) if s.id == start_slot_id), None)
+    if index is None:
+        return []
+    return ordered[index : index + need]
 
-    chunks = [c for c in re.split(r"[\s,;]+", raw.strip()) if c]
-    days: list[date] = []
-    seen: set[date] = set()
-    errors: list[str] = []
-    for part in chunks:
-        try:
-            d = parse_day(part)
-        except ValidationError:
-            errors.append(part)
-            continue
-        if d not in seen:
-            seen.add(d)
-            days.append(d)
-    return days, errors
 
-def normalize_phone(raw: str) -> str:
-    digits = "".join(ch for ch in raw if ch.isdigit() or ch == "+")
-    if len(digits) < 10:
-        raise ValidationError("Укажи номер телефона полностью.")
-    return digits
+def _map_booking_conflict(exc: IntegrityError) -> Exception:
+    """Translate a unique-index violation into the right domain error."""
+    detail = str(getattr(exc, "orig", exc))
+    if "uq_live_booking_user" in detail:
+        return AlreadyHasBookingError(
+            "У тебя уже есть активная запись. "
+            "Сначала отмени её или дождись визита."
+        )
+    return SlotNotAvailableError("Это время уже недоступно. Выбери другое окошко.")

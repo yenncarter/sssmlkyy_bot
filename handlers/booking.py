@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from contextlib import suppress
 
 from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
@@ -17,10 +18,14 @@ from callbacks.factories import (
     MenuCallback,
 )
 from config.settings import Settings
-from domain.dates import format_date_short, format_time
-from domain.enums import CallbackAction
+from db.models import Booking
+from domain.dates import format_date_short, format_time, now_local, to_local
+from domain.enums import BookingStatus, CallbackAction
 from domain.exceptions import AppError
+from domain.parsing import normalize_full_name, normalize_phone
+from handlers.filters import HasReceiptTarget
 from handlers.states import BookingFSM
+from presentation.formatters import format_client_booking_card
 from presentation.keyboards.booking import (
     cancel_confirm_keyboard,
     days_keyboard,
@@ -43,6 +48,7 @@ from presentation.texts.messages import (
     BOOKING_CONFIRMED,
     BOOKING_NO_SLOTS,
     BOOKING_PAYMENT,
+    BOOKING_RECEIPT_LATE,
     BOOKING_RECEIPT_WAIT,
     CANCEL_CONFIRM,
     MY_BOOKINGS_EMPTY,
@@ -50,24 +56,33 @@ from presentation.texts.messages import (
 )
 from presentation.ui.screens import prompt_screen, show_screen, show_text
 from services.notify_service import NotifyService
-from services.schedule_service import (
-    BookingService,
-    ScheduleService,
-    format_client_booking_card,
-    normalize_phone,
-)
+from services.schedule_service import BookingService, ScheduleService
 
 router = Router(name="booking")
 
+FLOW_RESET_TEXT = "Сессия записи сброшена. Начни заново через «Записаться»."
 
-def _hold_minutes_left(booking, fallback: int) -> int:
-    held_until = getattr(getattr(booking, "slot", None), "held_until", None)
+
+def _hold_minutes_left(booking: Booking, fallback: int) -> int:
+    """Minutes left on the hold, on the bot clock.
+
+    held_until is written in Europe/Moscow and comes back naive from SQLite —
+    reading it as UTC used to inflate the countdown by three hours.
+    """
+    held_until = to_local(getattr(booking.slot, "held_until", None))
     if held_until is None:
         return fallback
-    if held_until.tzinfo is None:
-        held_until = held_until.replace(tzinfo=timezone.utc)
-    seconds = (held_until - datetime.now(timezone.utc)).total_seconds()
+    seconds = (held_until - now_local()).total_seconds()
     return max(1, int(seconds // 60))
+
+
+def _render_my_bookings(items: list[Booking]) -> str:
+    lines = ["<b>Мои записи</b>\n"]
+    for booking in items:
+        lines.append(format_client_booking_card(booking))
+        lines.append("")
+    lines.append(MY_BOOKINGS_HINT)
+    return "\n".join(lines)
 
 
 @router.callback_query(MenuCallback.filter(F.action == CallbackAction.BOOK))
@@ -77,7 +92,10 @@ async def book_entry(
     bookings: BookingService,
 ) -> None:
     await callback.answer()
-    if await bookings.user_has_active_booking(callback.from_user.id):
+    user = callback.from_user
+    if user is None:
+        return
+    if await bookings.user_has_active_booking(user.id):
         await show_screen(
             callback,
             BOOKING_ALREADY_ACTIVE,
@@ -97,11 +115,12 @@ async def book_entry(
 
 @router.message(BookingFSM.full_name, F.text)
 async def booking_name(message: Message, state: FSMContext) -> None:
-    name = (message.text or "").strip()
-    if len(name) < 2:
+    try:
+        name = normalize_full_name(message.text or "")
+    except AppError as exc:
         await prompt_screen(
             message,
-            "Слишком коротко. Напиши имя ещё раз.",
+            exc.message,
             flow_cancel_keyboard(),
             state=state,
         )
@@ -244,14 +263,20 @@ async def booking_choose_slot(
 ) -> None:
     await callback.answer()
     data = await state.get_data()
+    full_name = data.get("full_name")
+    phone = data.get("phone")
+    if not full_name or not phone:
+        # State was truncated (bot restart with MemoryStorage, or a stale button).
+        await state.clear()
+        await show_screen(callback, FLOW_RESET_TEXT, footer_keyboard(), state=state)
+        return
     try:
         booking = await bookings.hold_slot(
             slot_id=callback_data.slot_id,
             user_id=callback.from_user.id,
             username=callback.from_user.username,
-            full_name=data["full_name"],
-            phone=data["phone"],
-            service=None,
+            full_name=full_name,
+            phone=phone,
         )
     except AppError as exc:
         await show_screen(
@@ -264,8 +289,8 @@ async def booking_choose_slot(
 
     await state.update_data(booking_id=booking.id)
     await state.set_state(BookingFSM.wait_receipt)
-    ws = await schedule.get_work_settings()
-    amount = ws.prepayment_amount or settings.prepayment_amount
+    work_hours = await schedule.get_work_settings()
+    amount = work_hours.prepayment_amount or settings.prepayment_amount
     day = booking.slot.working_day.day
     t = booking.slot.start_time
     text = BOOKING_PAYMENT.format(
@@ -283,6 +308,60 @@ async def booking_choose_slot(
     )
 
 
+def _receipt_file(message: Message) -> tuple[str, str] | None:
+    """(file_id, kind) of the attached receipt, or None if there is none."""
+    if message.photo:
+        return message.photo[-1].file_id, "photo"
+    if message.document is not None:
+        return message.document.file_id, "document"
+    return None
+
+
+async def _confirm_receipt(
+    message: Message,
+    state: FSMContext,
+    bookings: BookingService,
+    notify: NotifyService,
+    *,
+    booking_id: int,
+    user_id: int,
+    file_id: str,
+    file_type: str,
+) -> None:
+    """Shared tail of both receipt paths: confirm, answer, notify the master."""
+    await prompt_screen(
+        message,
+        BOOKING_RECEIPT_WAIT,
+        None,
+        state=state,
+        delete_user=False,
+    )
+    try:
+        booking = await bookings.confirm_with_receipt(
+            booking_id=booking_id,
+            user_id=user_id,
+            receipt_file_id=file_id,
+            receipt_file_type=file_type,
+        )
+    except AppError as exc:
+        await state.clear()
+        await prompt_screen(message, exc.message, footer_keyboard(), state=state)
+        return
+
+    await state.clear()
+    await prompt_screen(
+        message,
+        BOOKING_CONFIRMED.format(
+            date=format_date_short(booking.slot.working_day.day),
+            time=format_time(booking.slot.start_time),
+        ),
+        footer_keyboard(),
+        state=state,
+        delete_user=False,
+    )
+    await notify.new_booking_with_receipt(booking)
+
+
 @router.message(BookingFSM.wait_receipt, F.photo | F.document)
 async def booking_receipt(
     message: Message,
@@ -292,56 +371,31 @@ async def booking_receipt(
 ) -> None:
     data = await state.get_data()
     booking_id = data.get("booking_id")
-    if not booking_id:
+    if not booking_id or message.from_user is None:
         await state.clear()
         await prompt_screen(
             message,
-            "Сессия записи сброшена. Начни заново через «Записаться».",
+            FLOW_RESET_TEXT,
             footer_keyboard(),
             state=state,
         )
         return
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        file_type = "photo"
-    else:
-        doc = message.document
-        if doc is None:
-            await prompt_screen(message, "Пришли фото или файл чека.", state=state)
-            return
-        file_id = doc.file_id
-        file_type = "document"
 
-    await prompt_screen(
-        message,
-        BOOKING_RECEIPT_WAIT,
-        None,
-        state=state,
-        delete_user=False,
-    )
-
-    try:
-        booking = await bookings.confirm_with_receipt(
-            booking_id=booking_id,
-            user_id=message.from_user.id,  # type: ignore[union-attr]
-            receipt_file_id=file_id,
-            receipt_file_type=file_type,
-        )
-    except AppError as exc:
-        await state.clear()
-        await prompt_screen(message, exc.message, footer_keyboard(), state=state)
+    attachment = _receipt_file(message)
+    if attachment is None:
+        await prompt_screen(message, "Пришли фото или файл чека.", state=state)
         return
-    await state.clear()
-    day = booking.slot.working_day.day
-    t = booking.slot.start_time
-    await prompt_screen(
+
+    await _confirm_receipt(
         message,
-        BOOKING_CONFIRMED.format(date=format_date_short(day), time=format_time(t)),
-        footer_keyboard(),
-        state=state,
-        delete_user=False,
+        state,
+        bookings,
+        notify,
+        booking_id=booking_id,
+        user_id=message.from_user.id,
+        file_id=attachment[0],
+        file_type=attachment[1],
     )
-    await notify.new_booking_with_receipt(booking)
 
 
 @router.message(BookingFSM.wait_receipt)
@@ -358,6 +412,58 @@ async def booking_receipt_hint(
     )
 
 
+@router.message(StateFilter(None), F.photo | F.document, HasReceiptTarget())
+async def booking_receipt_recovered(
+    message: Message,
+    state: FSMContext,
+    bookings: BookingService,
+    notify: NotifyService,
+    receipt_target: Booking,
+) -> None:
+    """Receipt that arrived without FSM state — after a restart, for example.
+
+    The filter only lets this through when the database says this user really
+    owes a payment, so a random photo still gets the usual fallback reply.
+    """
+    attachment = _receipt_file(message)
+    if attachment is None or message.from_user is None:
+        return
+
+    file_id, file_type = attachment
+    if receipt_target.status == BookingStatus.PENDING_PAYMENT.value:
+        await _confirm_receipt(
+            message,
+            state,
+            bookings,
+            notify,
+            booking_id=receipt_target.id,
+            user_id=message.from_user.id,
+            file_id=file_id,
+            file_type=file_type,
+        )
+        return
+
+    # Hold already lapsed: the slot may be someone else's now, so hand the
+    # receipt to the master instead of quietly resurrecting the booking.
+    try:
+        booking = await bookings.attach_late_receipt(
+            receipt_target.id,
+            receipt_file_id=file_id,
+            receipt_file_type=file_type,
+        )
+    except AppError as exc:
+        await prompt_screen(message, exc.message, footer_keyboard(), delete_user=False)
+        return
+
+    await prompt_screen(
+        message,
+        BOOKING_RECEIPT_LATE,
+        footer_keyboard(),
+        delete_user=False,
+    )
+    await notify.receipt_after_expiry(booking)
+
+
 @router.callback_query(BookCancelCallback.filter())
 async def booking_cancel_flow(
     callback: CallbackQuery,
@@ -368,10 +474,9 @@ async def booking_cancel_flow(
     data = await state.get_data()
     booking_id = data.get("booking_id")
     if booking_id:
-        try:
+        # Already cancelled or swept away: the screen below is correct anyway.
+        with suppress(AppError):
             await bookings.cancel_booking(booking_id)
-        except AppError:
-            pass
     await state.clear()
     await show_screen(
         callback,
@@ -392,14 +497,9 @@ async def my_bookings(
     if not items:
         await show_text(callback, MY_BOOKINGS_EMPTY, footer_keyboard())
         return
-    lines = ["<b>Мои записи</b>\n"]
-    for b in items:
-        lines.append(format_client_booking_card(b))
-        lines.append("")
-    lines.append(MY_BOOKINGS_HINT)
     await show_screen(
         callback,
-        "\n".join(lines),
+        _render_my_bookings(items),
         my_bookings_keyboard(items),
         state=state,
     )
@@ -465,14 +565,9 @@ async def client_cancel_no(
     if not items:
         await show_screen(callback, MY_BOOKINGS_EMPTY, footer_keyboard(), state=state)
         return
-    lines = ["<b>Мои записи</b>\n"]
-    for b in items:
-        lines.append(format_client_booking_card(b))
-        lines.append("")
-    lines.append(MY_BOOKINGS_HINT)
     await show_screen(
         callback,
-        "\n".join(lines),
+        _render_my_bookings(items),
         my_bookings_keyboard(items),
         state=state,
     )
