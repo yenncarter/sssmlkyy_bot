@@ -5,17 +5,20 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     LOG_LEVEL=INFO
 
-WORKDIR /app
+# Bothost bind-mounts Git sources over /app at runtime. Keep the app and
+# site-packages install path outside that mount so deps are not hidden.
+# Persistent data still lives on the volume at /app/data.
+WORKDIR /usr/src/app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "import sqlalchemy, aiogram, aiosqlite, greenlet, tzdata"
 
 COPY . .
 
-# /app/data must be the persistent volume — SQLite lives there.
 RUN mkdir -p /app/data /app/logs \
     && useradd --create-home --uid 1000 bot \
-    && chown -R bot:bot /app
+    && chown -R bot:bot /usr/src/app /app/data /app/logs
 
 # No secrets in the image: BOT_TOKEN and friends come from the hosting panel.
 USER bot

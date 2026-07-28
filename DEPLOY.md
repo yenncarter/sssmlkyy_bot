@@ -17,12 +17,24 @@
 
 Ночные бэкапы бот сам шлёт мастеру в Telegram. Локальный снимок: `python scripts/backup_and_dump_sqlite.py`.
 
+## Dockerfile на Bothost
+
+В панели бота → **Дополнительные настройки** → включи **«Использовать собственный Dockerfile»**.
+
+Без этой галки Bothost может собрать образ своим шаблоном и **не поставить** пакеты из `requirements.txt` (симптом: `ModuleNotFoundError: No module named 'sqlalchemy'`, при этом `aiogram` уже импортируется).
+
+После деплоя в **логах сборки** должна быть строка установки/`Successfully installed` с `sqlalchemy`. В образе есть проверка `import sqlalchemy` — если её нет в build-логе, зависимости не поставились.
+
+Код в образе лежит в `/usr/src/app` (Bothost монтирует Git поверх `/app`). БД по-прежнему только в volume `/app/data`.
+
 ## Чеклист перед деплоем
 
+- [ ] Включена галка «Использовать собственный Dockerfile»
 - [ ] Один процесс polling (не локалка + Bothost на одном токене)
 - [ ] Volume `/app/data` подключён
 - [ ] Secrets в панели Bothost (`.env` не в образе)
 - [ ] `python scripts/smoke_logic.py` — зелёный
+- [ ] В build-логе есть установка `sqlalchemy`
 
 ### Обязательные переменные
 
