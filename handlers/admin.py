@@ -156,23 +156,6 @@ async def cmd_status(
     await message.answer(format_bot_status(status))
 
 
-@router.callback_query(AdminCallback.filter(F.action == "status"))
-async def admin_status(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db_health: DbHealthService,
-    media_cache: MediaCache,
-) -> None:
-    await callback.answer()
-    status = await db_health.diagnose(media_cached=media_cache.size)
-    await show_screen(
-        callback,
-        format_bot_status(status),
-        admin_home_keyboard(),
-        state=state,
-    )
-
-
 @router.callback_query(AdminCallback.filter(F.action == "home"))
 async def admin_home_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()

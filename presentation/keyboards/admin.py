@@ -63,12 +63,6 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
             callback_data=AdminCallback(action="client_menu").pack(),
         ),
     )
-    builder.row(
-        InlineKeyboardButton(
-            text="🛠 Состояние бота",
-            callback_data=AdminCallback(action="status").pack(),
-        ),
-    )
     return builder.as_markup()
 
 

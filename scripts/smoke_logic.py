@@ -154,7 +154,7 @@ async def main() -> int:
         t.check("setup_routers()", False, str(exc))
 
     home_kb = str(admin_kb.admin_home_keyboard())
-    for label in ("Записи", "График", "Настройки", "Состояние"):
+    for label in ("Записи", "График", "Настройки"):
         t.check(f"home kb has {label}", label in home_kb)
 
     # ---------- parsers ----------
