@@ -36,6 +36,40 @@ class AppContainer:
         engine = create_engine(settings.database_url)
         await init_db(engine)
         session_factory = create_session_factory(engine)
+
+        # Startup DB reality check (Bothost path / empty volume / wrong file).
+        try:
+            from pathlib import Path
+            from sqlalchemy import func, select
+
+            from db.models import Booking, WorkingDay
+
+            url = settings.database_url
+            print(f"DB url scheme={url.split('://')[0]}", flush=True)
+            if "sqlite" in url:
+                # sqlite+aiosqlite:////app/data/bot.db → /app/data/bot.db
+                raw_path = url.split("sqlite+aiosqlite:///")[-1]
+                db_path = Path(raw_path)
+                print(
+                    f"DB file={db_path} exists={db_path.exists()} "
+                    f"size={db_path.stat().st_size if db_path.exists() else 0}",
+                    flush=True,
+                )
+            async with session_factory() as session:
+                days = await session.scalar(select(func.count()).select_from(WorkingDay))
+                books = await session.scalar(select(func.count()).select_from(Booking))
+                active = await session.scalar(
+                    select(func.count())
+                    .select_from(Booking)
+                    .where(Booking.status == "active")
+                )
+                print(
+                    f"DB counts days={days} bookings={books} active={active}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"DB inventory failed: {exc}", flush=True)
+
         media_cache = MediaCache()
         return cls(
             settings=settings,

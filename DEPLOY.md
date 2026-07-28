@@ -1,25 +1,32 @@
 # Deploy — @vikalashmeBot (время бота = Europe/Moscow, как на телефоне)
 
-Если с ПК не открывается `api.telegram.org` — крути бота в облаке.  
-Бот **не использует** `PROXY_URL` (прокси только для системы/VPN на ПК).
+Прод: **[Bothost](https://bothost.ru/)** (GitHub → автодеплой).  
+Бот **не использует** `PROXY_URL`.
 
-Если на Fly когда-то ставили прокси — сними секрет (иначе он бесполезен, но лучше убрать):
+## Bothost — обязательно
 
-```powershell
-fly secrets unset PROXY_URL
-fly deploy
-```
+По [доке Bothost](https://bothost.ru/docs/database-storage):
+
+1. SQLite **только** в volume: `/app/data/bot.db`
+2. Env в панели:
+   ```
+   DATABASE_URL=sqlite+aiosqlite:////app/data/bot.db
+   ```
+3. **Бесплатный тариф:** данные **стираются при рестарте** — для живых записей нужен Basic/Pro (persistent volume).
+4. Восстановление бэкапа: останови бота → файловый менеджер → залей `bot.db` в `/app/data/` → env как выше → старт.
+
+Локальный бэкап для заливки: `data/backups/bot.db` (копия consistent dump).
 
 ---
 
 ## Перед деплоем (чеклист)
 
-- [ ] Один процесс polling (не два Fly machine / не два VPS)
-- [ ] Postgres в проде (SQLite только локально)
-- [ ] Secrets заданы, `.env` **не** копируется в образ (есть `.dockerignore`)
-- [ ] Бот добавлен админом канала `@vikalashme` (если включите проверку подписки)
+- [ ] Один процесс polling (не локалка + Bothost одновременно на одном токене)
+- [ ] `DATABASE_URL` → `/app/data/bot.db` (не относительный путь в Git-дереве)
+- [ ] Платный тариф / volume, если нужны живые записи
+- [ ] Secrets в панели Bothost, `.env` **не** в образе
+- [ ] Бот админ канала `@vikalashme` (если включите подписку)
 - [ ] `python scripts/smoke_logic.py` — зелёный
-- [ ] Локально: `python scripts/audit_clock_db.py` — время = телефон (Moscow), БД чистая
 
 ### Обязательные secrets
 

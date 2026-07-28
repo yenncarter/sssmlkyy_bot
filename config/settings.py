@@ -13,7 +13,40 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PORTFOLIO_DIR = BASE_DIR / "images" / "portfolio"
 WELCOME_IMAGE = BASE_DIR / "images" / "welcome" / "cover.jpg"
 DATA_DIR = BASE_DIR / "data"
-DEFAULT_SQLITE_URL = f"sqlite+aiosqlite:///{(DATA_DIR / 'bot.db').as_posix()}"
+# Bothost: persistent volume is /app/data (see https://bothost.ru/docs/database-storage).
+BOTHOST_DATA_DIR = Path("/app/data")
+BOTHOST_SQLITE_URL = "sqlite+aiosqlite:////app/data/bot.db"
+
+
+def _running_on_bothost_or_docker() -> bool:
+    if Path("/.dockerenv").exists():
+        return True
+    if BOTHOST_DATA_DIR.is_dir():
+        return True
+    # Bothost / common PaaS markers (best-effort).
+    return bool(os.getenv("BOTHOST") or os.getenv("BOTHOST_APP_ID"))
+
+
+def _default_sqlite_url() -> str:
+    if _running_on_bothost_or_docker():
+        BOTHOST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return BOTHOST_SQLITE_URL
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return f"sqlite+aiosqlite:///{(DATA_DIR / 'bot.db').as_posix()}"
+
+
+def _normalize_database_url(raw: str) -> str:
+    """Force container SQLite onto the Bothost volume path."""
+    url = raw.strip()
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if "sqlite" in url and _running_on_bothost_or_docker():
+        # Any sqlite URL in container → /app/data/bot.db (volume).
+        BOTHOST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return BOTHOST_SQLITE_URL
+    return url
 
 load_dotenv(BASE_DIR / ".env", override=False)
 
@@ -156,11 +189,9 @@ class Settings:
         if not payment_link:
             raise ValueError("PAYMENT_LINK is required (SBP / card / payment URL)")
 
-        database_url = os.getenv("DATABASE_URL", "").strip() or DEFAULT_SQLITE_URL
-        if database_url.startswith("postgres://"):
-            database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif database_url.startswith("postgresql://"):
-            database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        database_url = _normalize_database_url(
+            os.getenv("DATABASE_URL", "").strip() or _default_sqlite_url()
+        )
 
         hold_raw = os.getenv("SLOT_HOLD_MINUTES", "15").strip()
         try:
@@ -168,7 +199,11 @@ class Settings:
         except ValueError as exc:
             raise ValueError("SLOT_HOLD_MINUTES must be an integer") from exc
 
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # Ensure local data dir exists; on Bothost volume is /app/data.
+        if "sqlite" in database_url and _running_on_bothost_or_docker():
+            BOTHOST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        else:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         return cls(
             bot_token=bot_token,
